@@ -1,0 +1,167 @@
+/*
+ * SPDX-FileCopyrightText: 2025 Copyright (c) Contributors to the Eclipse Foundation
+ *
+ * See the NOTICE file(s) distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Apache License Version 2.0 which is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package webserver
+
+import ecu.DTCExtendedDataRecord
+import ecu.DTCSnapshotParameter
+import ecu.DTCSnapshotRecord
+import ecu.DTCStatusMask
+import ecu.DTCStatusMask.Companion.parse
+import ecu.DtcFault
+import kotlinx.serialization.Serializable
+import library.toHexString
+import utils.dtcToId
+import java.nio.ByteBuffer
+
+@Serializable
+class DTCStatusMaskDto(
+    var testFailed: Boolean?,
+    var testFailedThisOperationCycle: Boolean?,
+    var pendingDtc: Boolean?,
+    var confirmedDtc: Boolean?,
+    var testNotCompletedSinceLastClear: Boolean?,
+    var testFailedSinceLastClear: Boolean?,
+    var testNotCompletedThisOperationCycle: Boolean?,
+    var warningIndicatorRequested: Boolean?,
+)
+
+fun statusMaskFromDto(
+    status: DTCStatusMaskDto?,
+    statusMask: String?,
+): DTCStatusMask =
+    if (statusMask != null) {
+        parse(ByteBuffer.wrap(byteArrayOf(statusMask.toUByte(16).toByte())))
+    } else {
+        DTCStatusMask(
+            testFailed = status?.testFailed ?: true,
+            testFailedThisOperationCycle = status?.testFailedThisOperationCycle ?: false,
+            pendingDtc = status?.pendingDtc ?: false,
+            confirmedDtc = status?.confirmedDtc ?: true,
+            testNotCompletedSinceLastClear = status?.testNotCompletedSinceLastClear ?: false,
+            testFailedSinceLastClear = status?.testFailedSinceLastClear ?: false,
+            testNotCompletedThisOperationCycle = status?.testNotCompletedThisOperationCycle ?: false,
+            warningIndicatorRequested = status?.warningIndicatorRequested ?: false,
+        )
+    }
+
+fun DTCStatusMask.toDto() =
+    DTCStatusMaskDto(
+        testFailed = testFailed,
+        testFailedThisOperationCycle = testFailedThisOperationCycle,
+        pendingDtc = pendingDtc,
+        confirmedDtc = confirmedDtc,
+        testNotCompletedSinceLastClear = testNotCompletedSinceLastClear,
+        testFailedSinceLastClear = testFailedSinceLastClear,
+        testNotCompletedThisOperationCycle = testNotCompletedThisOperationCycle,
+        warningIndicatorRequested = warningIndicatorRequested,
+    )
+
+@Serializable
+class DTCSnapshotRecordDto(
+    var did: String,
+    var data: String,
+)
+
+@Serializable
+class DTCSnapshotParameterDto(
+    var recordNumber: String,
+    var records: List<DTCSnapshotRecordDto> = emptyList(),
+)
+
+@Serializable
+class DTCExtendedDataRecordDto(
+    var recordNumber: String,
+    var data: String,
+)
+
+@Serializable
+class DtcFaultDto(
+    var id: String?,
+    var status: DTCStatusMaskDto?,
+    var statusMask: String?,
+    var emissionsRelated: Boolean?,
+    var snapshots: List<DTCSnapshotParameterDto>? = null,
+    var extendedData: List<DTCExtendedDataRecordDto>? = null,
+)
+
+fun dtcFaultFromDto(dto: DtcFaultDto): DtcFault =
+    DtcFault(
+        id = dto.id!!.dtcToId(),
+        status = statusMaskFromDto(dto.status, dto.statusMask),
+        emissionsRelated = dto.emissionsRelated ?: false,
+        snapshots =
+            dto.snapshots?.map { snapshotDto ->
+                DTCSnapshotParameter(
+                    recordNumber = snapshotDto.recordNumber.toUByte(16).toByte(),
+                    records =
+                        snapshotDto.records.map { recordDto ->
+                            object : DTCSnapshotRecord {
+                                override val did: UShort = recordDto.did.toUShort(16)
+                                override val data: ByteArray =
+                                    recordDto.data
+                                        .chunked(2)
+                                        .map { it.toUByte(16).toByte() }
+                                        .toByteArray()
+                            }
+                        },
+                )
+            } ?: emptyList(),
+        extendedData =
+            dto.extendedData?.map { extDto ->
+                object : DTCExtendedDataRecord {
+                    override val recordNumber: Byte = extDto.recordNumber.toUByte(16).toByte()
+                    override val asByteArray: ByteArray =
+                        extDto.data
+                            .chunked(2)
+                            .map { it.toUByte(16).toByte() }
+                            .toByteArray()
+                }
+            } ?: emptyList(),
+    )
+
+fun DtcFault.toDto(): DtcFaultDto =
+    DtcFaultDto(
+        id = id.toString(16),
+        status = status.toDto(),
+        statusMask = status.asByteArray.toHexString(),
+        emissionsRelated = emissionsRelated,
+        snapshots =
+            snapshots.map { snapshot ->
+                DTCSnapshotParameterDto(
+                    recordNumber =
+                        snapshot.recordNumber
+                            .toUByte()
+                            .toString(16)
+                            .padStart(2, '0'),
+                    records =
+                        snapshot.records.map { record ->
+                            DTCSnapshotRecordDto(
+                                did = record.did.toString(16).padStart(4, '0'),
+                                data = record.data.toHexString(separator = ""),
+                            )
+                        },
+                )
+            },
+        extendedData =
+            extendedData.map { ext ->
+                DTCExtendedDataRecordDto(
+                    recordNumber =
+                        ext.recordNumber
+                            .toUByte()
+                            .toString(16)
+                            .padStart(2, '0'),
+                    data = ext.asByteArray.toHexString(separator = ""),
+                )
+            },
+    )
