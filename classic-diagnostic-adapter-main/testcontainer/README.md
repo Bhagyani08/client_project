@@ -1,0 +1,82 @@
+<!--
+SPDX-FileCopyrightText: 2026 Copyright (c) Contributors to the Eclipse Foundation
+
+See the NOTICE file(s) distributed with this work for additional
+information regarding copyright ownership.
+
+This program and the accompanying materials are made available under the
+terms of the Apache License Version 2.0 which is available at
+https://www.apache.org/licenses/LICENSE-2.0
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Test Setup
+
+NOTE: Implemented services in the odx are not fully tested yet with the CDA,
+and for some there are open issues to make them work.
+
+## Test using docker compose
+
+### Prerequisites
+
+- Docker and Docker Compose installed
+- ODX converter built (optional, for PDX to MDD conversion)
+
+### Setup
+
+see [first_steps](first_steps.md)
+
+## Examples
+
+```sh
+export ACCESS_TOKEN=$(curl -s -X POST -H "Content-Type: application/json" "http://localhost:20002/vehicle/v15/authorize" --data '{"client_id":"test", "client_secret":"secret"}' | jq -r .access_token)
+
+# retrieve standardized resource collection for ECU (+ variant)
+curl -s -X GET -H "Authorization: Bearer $ACCESS_TOKEN" "http://localhost:20002/vehicle/v15/components/FLXC1000" | jq .
+
+# acquire component lock
+curl -s -X POST -H "Authorization: Bearer $ACCESS_TOKEN" -H "Content-Type: application/json" "http://localhost:20002/vehicle/v15/components/FLXC1000/locks" --data '{"lock_expiration": 100000}'
+
+# switch into extended session
+curl -s -X PUT -H "Authorization: Bearer $ACCESS_TOKEN" -H "Content-Type: application/json" "http://localhost:20002/vehicle/v15/components/FLXC1000/modes/session" --data '{"value": "extended"}'
+
+# switch sim to boot variant
+curl -s -X PUT -H "Content-Type: application/json" "http://localhost:8181/FLXC1000/state" --data '{"variant": "BOOT"}'
+
+# force variant detection
+curl -s -X PUT -H "Authorization: Bearer $ACCESS_TOKEN" -H "Content-Type: application/json" "http://localhost:20002/vehicle/v15/components/FLXC1000"
+
+# security access status
+curl -s -X GET -H "Authorization: Bearer $ACCESS_TOKEN" "http://localhost:20002/vehicle/v15/components/FLXC1000/modes/security" | jq .
+
+# request seed (security access)
+curl -s -X PUT -H "Content-Type: application/json" -H "Authorization: Bearer $ACCESS_TOKEN" "http://localhost:20002/vehicle/v15/components/FLXC1000/modes/security" --data '{"value": "Level_5_RequestSeed"}' | jq .
+
+# send key (security access) -- doesn't work yet
+curl -s -X PUT -H "Content-Type: application/json" -H "Authorization: Bearer $ACCESS_TOKEN" "http://localhost:20002/vehicle/v15/components/FLXC1000/modes/security" --data '{"value": "Level_5", "Key": { "Security": "0x12 0x34 0x56" } }' | jq .
+
+```
+
+## Managing MDD files
+
+The repository contains MDDs file which have been generated via `odxtools` and the python scripts located in `testcontainer/odx/`.
+To update them manually run the following commands. This requires the odx-converter as described in the repository readme.
+This step is only necessary when changes to the ECU database have been made.
+
+For normal operation / testing this is not needed.
+
+```sh
+# Generate ODX files
+cd testcontainer/odx
+./generate_docker.sh
+cd ..
+
+# Convert PDX to MDD (if you have the converter)
+cd odx
+java -jar <path-to-odx-converter>/converter/build/libs/converter-all.jar FLXC1000.pdx
+cd ..
+```
+
+Unfortunately for legal reasons, we can't provide a binary release at the moment. We're trying to get permissions
+from the involved parties, but it's a slow process.

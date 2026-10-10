@@ -1,0 +1,505 @@
+# SPDX-FileCopyrightText: 2025 Copyright (c) Contributors to the Eclipse Foundation
+#
+# See the NOTICE file(s) distributed with this work for additional
+# information regarding copyright ownership.
+#
+# This program and the accompanying materials are made available under the
+# terms of the Apache License Version 2.0 which is available at
+# https://www.apache.org/licenses/LICENSE-2.0
+#
+# SPDX-License-Identifier: Apache-2.0
+
+
+import odxtools
+from authentication import add_authentication_services
+from communication_control import add_communication_control_services
+from comparams import generate_comparam_refs, generate_minimal_comparam_refs
+from dtc_services import (
+    add_dtc_clear_services,
+    add_dtc_clear_user_memory_service,
+    add_dtc_read_services,
+    add_dtc_setting_services,
+)
+from functional_groups import generate_functional_groups
+from helper import ref
+from metadata import (
+    add_additional_audiences,
+    add_admin_data,
+    add_company_datas,
+    add_functional_classes,
+)
+from odxtools.database import Database
+from odxtools.diagdatadictionaryspec import DiagDataDictionarySpec
+from odxtools.diaglayercontainer import DiagLayerContainer
+from odxtools.diaglayers.basevariant import BaseVariant
+from odxtools.diaglayers.basevariantraw import BaseVariantRaw
+from odxtools.diaglayers.diaglayertype import DiagLayerType
+from odxtools.diaglayers.ecuvariant import EcuVariant
+from odxtools.diaglayers.ecuvariantraw import EcuVariantRaw
+from odxtools.ecuvariantpattern import EcuVariantPattern
+from odxtools.matchingparameter import MatchingParameter
+from odxtools.odxlink import DocType, OdxDocFragment, OdxLinkId
+from odxtools.parentref import ParentRef
+from odxtools.specialdata import SpecialData
+from odxtools.specialdatagroup import SpecialDataGroup
+from odxtools.specialdatagroupcaption import SpecialDataGroupCaption
+from reset import add_reset_services
+from routine_control import add_routine_control_services
+from security_access import add_security_access_services
+from shared import (
+    add_common_datatypes,
+    add_common_diag_comms,
+    add_power_consumption_service,
+    add_state_charts,
+)
+from shared_units import add_common_units
+from transferdata import add_transfer_services
+
+
+def add_variant(dlc: DiagLayerContainer, name: str, identification_pattern: int):
+    ecu_name = dlc.short_name
+    doc_frags = dlc.odx_id.doc_fragments
+    variant = EcuVariantRaw(
+        odx_id=OdxLinkId(local_id=f"EV.{ecu_name}.{name}", doc_fragments=doc_frags),
+        short_name=name,
+        variant_type=DiagLayerType.ECU_VARIANT,
+        ecu_variant_patterns=[
+            EcuVariantPattern(
+                matching_parameters=[
+                    MatchingParameter(
+                        expected_value=str(identification_pattern),
+                        diag_comm_snref="Identification_Read",
+                        out_param_if_snref="Identification",
+                    )
+                ]
+            )
+        ],
+        parent_refs=[ParentRef(layer_ref=ref(dlc.base_variants[0].odx_id))],
+        diag_data_dictionary_spec=DiagDataDictionarySpec(),
+    )
+    if "_Boot_" in name:
+        add_security_access_services(dlc, variant)
+
+    dlc.ecu_variants.append(EcuVariant(diag_layer_raw=variant))
+
+
+def get_default_sdgs(dlc: DiagLayerContainer, ecu_name: str) -> list[SpecialDataGroup]:
+    doc_frags = dlc.odx_id.doc_fragments
+
+    if ecu_name == "FLXC1000":
+        return [
+            SpecialDataGroup(
+                sdg_caption=SpecialDataGroupCaption(
+                    odx_id=OdxLinkId(
+                        local_id=f"EV.{ecu_name}.SDG.DefaultSDG",
+                        doc_fragments=doc_frags,
+                    ),
+                    short_name="default_sdg",
+                    long_name="Default SDG",
+                ),
+                semantic_info="default",
+                values=[
+                    SpecialData(
+                        semantic_info="power_requirement_max",
+                        value="1.21GW",
+                    )
+                ],
+            )
+        ]
+
+    return []
+
+
+def get_service_sdgs(
+    dlc: DiagLayerContainer, ecu_name: str
+) -> tuple[list[SpecialDataGroup], dict[str, list[SpecialDataGroup]]]:
+    """Return (data_service_sdgs, routine_sdgs_by_service) for the given ECU.
+
+    data_service_sdgs: SDGs to attach to the FluxCapacitorPowerConsumption_Read service.
+    routine_sdgs_by_service: maps routine service short names to their SDG lists.
+    """
+    doc_frags = dlc.odx_id.doc_fragments
+
+    if ecu_name != "FLXC1000":
+        return [], {}
+
+    data_sdgs = [
+        SpecialDataGroup(
+            sdg_caption=SpecialDataGroupCaption(
+                odx_id=OdxLinkId(
+                    local_id=f"EV.{ecu_name}.SDG.FluxCapacitorSDG",
+                    doc_fragments=doc_frags,
+                ),
+                short_name="flux_capacitor_sdg",
+                long_name="Flux Capacitor Metadata",
+            ),
+            semantic_info="sensor_metadata",
+            values=[
+                SpecialData(
+                    semantic_info="measurement_unit",
+                    value="gigawatts",
+                )
+            ],
+        )
+    ]
+
+    routine_sdgs = {
+        "SelfTest_Start": [
+            SpecialDataGroup(
+                sdg_caption=SpecialDataGroupCaption(
+                    odx_id=OdxLinkId(
+                        local_id=f"EV.{ecu_name}.SDG.SelfTestSDG",
+                        doc_fragments=doc_frags,
+                    ),
+                    short_name="self_test_sdg",
+                    long_name="Self Test Metadata",
+                ),
+                semantic_info="routine_metadata",
+                values=[
+                    SpecialData(
+                        semantic_info="expected_duration_ms",
+                        value="5000",
+                    )
+                ],
+            )
+        ]
+    }
+
+    return data_sdgs, routine_sdgs
+
+
+def add_base_variant(
+    dlc: DiagLayerContainer,
+    logical_address: int,
+    gateway_address: int,
+    functional_address: int,
+    database: Database,
+    sdgs: list[SpecialDataGroup] | None = None,
+    tester_present_message: str | None = None,
+    tester_present_req_resp: str | None = None,
+):
+    ecu_name = dlc.short_name
+    doc_frags = dlc.odx_id.doc_fragments
+    base_variant = BaseVariantRaw(
+        odx_id=OdxLinkId(local_id=f"BV.{ecu_name}", doc_fragments=doc_frags),
+        short_name=ecu_name,
+        comparam_refs=generate_comparam_refs(
+            ecu_name=ecu_name,
+            logical_address=logical_address,
+            functional_address=functional_address,
+            gateway_address=gateway_address,
+            database=database,
+            tester_present_message=tester_present_message,
+            tester_present_req_resp=tester_present_req_resp,
+        ),
+        variant_type=DiagLayerType.BASE_VARIANT,
+        parent_refs=[
+            ParentRef(
+                layer_ref=ref(
+                    OdxLinkId(
+                        local_id="PROTO.UDS_Ethernet_DoIP",
+                        doc_fragments=(
+                            OdxDocFragment(
+                                doc_name="UDS_Ethernet_DoIP", doc_type=DocType.CONTAINER
+                            ),
+                        ),
+                    )
+                )
+            ),
+            ParentRef(
+                layer_ref=ref(
+                    OdxLinkId(
+                        local_id="PROTO.UDS_Ethernet_DoIP_DOBT",
+                        doc_fragments=(
+                            OdxDocFragment(
+                                doc_name="UDS_Ethernet_DoIP_DOBT",
+                                doc_type=DocType.CONTAINER,
+                            ),
+                        ),
+                    )
+                )
+            ),
+        ],
+        diag_data_dictionary_spec=DiagDataDictionarySpec(),
+        sdgs=sdgs or get_default_sdgs(dlc, ecu_name),
+    )
+
+    add_functional_classes(base_variant)
+    add_common_units(base_variant)
+    add_common_datatypes(base_variant)
+    add_state_charts(base_variant)
+
+    # Retrieve service-level SDGs (only populated for FLXC1000)
+    data_sdgs, routine_sdgs = get_service_sdgs(dlc, ecu_name)
+
+    # common services (session (10 xx), vin, ident)
+    add_common_diag_comms(base_variant)
+    # 11
+    add_reset_services(base_variant)
+    # 28
+    add_communication_control_services(base_variant)
+    # 29
+    add_authentication_services(base_variant)
+    # 34, 36, 37
+    add_transfer_services(base_variant)
+    # 85
+    add_dtc_setting_services(base_variant)
+    # 19
+    add_dtc_read_services(base_variant)
+    # 14
+    add_dtc_clear_services(base_variant)
+    # 31 - Clear User-Defined DTC Memory
+    add_dtc_clear_user_memory_service(base_variant)
+    # 31 - Operations (SelfTest, CalibrateSensors)
+    add_routine_control_services(base_variant, sdgs_by_service=routine_sdgs)
+
+    # FLXC1000-specific services
+    if ecu_name == "FLXC1000":
+        add_power_consumption_service(base_variant, sdgs=data_sdgs)
+
+    dlc.base_variants.append(BaseVariant(diag_layer_raw=base_variant))
+
+
+def generate_for_ecu(
+    ecu_name: str,
+    logical_address: int,
+    gateway_address: int,
+    functional_address: int,
+    variants: list[tuple[str, int]],
+    tester_present_message: str | None = None,
+    tester_present_req_resp: str | None = None,
+):
+    print(f"Generating for {ecu_name}")
+    database = Database()
+    database.short_name = ecu_name
+
+    for odx_filename in (
+        "base/ISO_13400_2.odx-cs",
+        "base/ISO_14229_5.odx-cs",
+        "base/ISO_14229_5_on_ISO_13400_2.odx-c",
+        "base/UDS_Ethernet_DoIP.odx-d",
+        "base/UDS_Ethernet_DoIP_DOBT.odx-d",
+    ):
+        database.add_odx_file(odx_filename)
+
+    # checks consistency for existing files
+    database.refresh()
+
+    doc_frags = (OdxDocFragment(ecu_name, DocType.CONTAINER),)
+
+    dlc = DiagLayerContainer(
+        odx_id=OdxLinkId(f"DLC.{ecu_name}", doc_fragments=doc_frags),
+        short_name=ecu_name,
+    )
+    add_admin_data(dlc)
+    add_company_datas(dlc)
+    add_additional_audiences(dlc)
+
+    add_base_variant(
+        dlc=dlc,
+        logical_address=logical_address,
+        gateway_address=gateway_address,
+        functional_address=functional_address,
+        database=database,
+        tester_present_message=tester_present_message,
+        tester_present_req_resp=tester_present_req_resp,
+    )
+
+    for variant_name, identification_pattern in variants:
+        add_variant(
+            dlc=dlc,
+            name=f"{ecu_name}_{variant_name}",
+            identification_pattern=identification_pattern,
+        )
+
+    database.diag_layer_containers.append(dlc)
+
+    database.refresh()  # probably not necessary
+    odxtools.write_pdx_file(f"{ecu_name}.pdx", database)
+
+
+def generate_for_ecu_minimal_comparams(
+    ecu_name: str,
+    logical_address: int,
+    variants: list[tuple[str, int]],
+    protocol_snref: str | None = None,
+):
+    """Generate an ECU database with only CP_UniqueRespIdTable as comparam.
+
+    Gateway and functional addresses are intentionally absent from the MDD so
+    that they can be supplied via the CDA's per-ECU config overrides.
+    """
+    print(f"Generating (minimal comparams) for {ecu_name}")
+    database = Database()
+    database.short_name = ecu_name
+
+    odx_files = [
+        "base/ISO_13400_2.odx-cs",
+        "base/ISO_14229_5.odx-cs",
+        "base/ISO_14229_5_on_ISO_13400_2.odx-c",
+    ]
+    if protocol_snref is not None:
+        odx_files.append("base/DMC_DoIP.odx-d")
+
+    for odx_filename in odx_files:
+        database.add_odx_file(odx_filename)
+
+    database.refresh()
+
+    doc_frags = (OdxDocFragment(ecu_name, DocType.CONTAINER),)
+
+    dlc = DiagLayerContainer(
+        odx_id=OdxLinkId(f"DLC.{ecu_name}", doc_fragments=doc_frags),
+        short_name=ecu_name,
+    )
+    add_admin_data(dlc)
+    add_company_datas(dlc)
+    add_additional_audiences(dlc)
+
+    # Use minimal comparam refs - only CP_UniqueRespIdTable
+    _add_base_variant_minimal_comparams(
+        dlc=dlc,
+        logical_address=logical_address,
+        database=database,
+        protocol_snref=protocol_snref,
+    )
+
+    for variant_name, identification_pattern in variants:
+        add_variant(
+            dlc=dlc,
+            name=f"{ecu_name}_{variant_name}",
+            identification_pattern=identification_pattern,
+        )
+
+    database.diag_layer_containers.append(dlc)
+    database.refresh()
+    odxtools.write_pdx_file(f"{ecu_name}.pdx", database)
+
+
+def _add_base_variant_minimal_comparams(
+    dlc: DiagLayerContainer,
+    logical_address: int,
+    database: Database,
+    protocol_snref: str | None = None,
+):
+    """Like add_base_variant but uses generate_minimal_comparam_refs."""
+    ecu_name = dlc.short_name
+    doc_frags = dlc.odx_id.doc_fragments
+    base_variant = BaseVariantRaw(
+        odx_id=OdxLinkId(local_id=f"BV.{ecu_name}", doc_fragments=doc_frags),
+        short_name=ecu_name,
+        comparam_refs=generate_minimal_comparam_refs(
+            ecu_name=ecu_name,
+            logical_address=logical_address,
+            database=database,
+            protocol_snref=protocol_snref,
+        ),
+        variant_type=DiagLayerType.BASE_VARIANT,
+        parent_refs=[
+            ParentRef(
+                layer_ref=ref(
+                    OdxLinkId(
+                        local_id=f"PROTO.{protocol_snref}",
+                        doc_fragments=(
+                            OdxDocFragment(doc_name=protocol_snref, doc_type=DocType.CONTAINER),
+                        ),
+                    )
+                )
+            ),
+        ]
+        if protocol_snref is not None
+        else [],
+        diag_data_dictionary_spec=DiagDataDictionarySpec(),
+        sdgs=get_default_sdgs(dlc, ecu_name),
+    )
+
+    add_functional_classes(base_variant)
+    add_common_units(base_variant)
+    add_common_datatypes(base_variant)
+    add_state_charts(base_variant)
+
+    add_common_diag_comms(base_variant)
+    add_reset_services(base_variant)
+    add_communication_control_services(base_variant)
+    add_authentication_services(base_variant)
+    add_transfer_services(base_variant)
+    add_dtc_setting_services(base_variant)
+    add_dtc_read_services(base_variant)
+    add_dtc_clear_services(base_variant)
+    add_dtc_clear_user_memory_service(base_variant)
+    add_routine_control_services(base_variant)
+
+    dlc.base_variants.append(BaseVariant(diag_layer_raw=base_variant))
+
+
+generate_for_ecu(
+    ecu_name="FLXC1000",
+    logical_address=0x1000,
+    gateway_address=0x1000,
+    functional_address=0xFFFF,
+    variants=[("Boot_Variant", 0xFF0000), ("App_0101", 0x000101)],
+    # FLXC1000 carries the tester-present com-params in its MDD (DB-provided
+    # path). ReqResp=0 => suppress positive response (3E 80). Other ECUs omit
+    # these and fall back to the CDA config defaults.
+    tester_present_message="3E00",
+    tester_present_req_resp="0",
+)
+
+# mirror a use-case, where for different markets different hardware revisions
+# (for whatever reason) are used, but due to having the same function,
+# the logical address would be the same.
+# The CDA should be able to differentiate those variants based on the variant response.
+# During variant detection on of the ECUs is selected, whereas the other is marked as duplicate.
+generate_for_ecu(
+    ecu_name="FLXCNG1000",
+    logical_address=0x1000,
+    gateway_address=0x1000,
+    functional_address=0xFFFF,
+    variants=[("App_1010", 0x001010)],
+)
+
+generate_for_ecu(
+    ecu_name="FSNR2000",
+    logical_address=0x2000,
+    gateway_address=0x2000,
+    functional_address=0xFFFF,
+    variants=[("Boot_Variant", 0xFF0000), ("App_0101", 0x000101)],
+)
+
+# TMCC3000 - Time Machine Control Computer
+# CP_UniqueRespIdTable is present so the CDA resolves the ECU logical address.
+# CP_DoIPLogicalGatewayAddress is present with a *wrong* value (0xDEAD) so
+# that the integration test can verify precedence = "Config" overrides the DB.
+# The correct gateway address (0x3000) is supplied via per-ECU config.
+# No protocol is referenced (no parent_ref, no protocol_snref), so
+# ignore_protocol must be enabled.
+generate_for_ecu_minimal_comparams(
+    ecu_name="TMCC3000",
+    logical_address=0x3000,
+    variants=[("App_0101", 0x000301)],
+)
+
+# HOVR4000 - Hover conversion.
+# Uses DMC_DoIP as protocol short-name (differs from the global default
+# UDS_Ethernet_DoIP_DOBT), so the CDA must be configured with a per-ECU
+# protocol override to load this ECU.
+generate_for_ecu_minimal_comparams(
+    ecu_name="HOVR4000",
+    logical_address=0x4000,
+    variants=[("App_0101", 0x000401)],
+    protocol_snref="DMC_DoIP",
+)
+
+# JGWT5000 - Jigowatt Power Regulator.
+# Uses DMC_DoIP as protocol short-name (doesn't match the global default
+# UDS_Ethernet_DoIP_DOBT), but unlike HOVR4000 there is NO per-ECU protocol
+# override. Instead, ignore_protocol is enabled so into_db_protocol falls
+# back to the single DB protocol and com-param lookup matches by name alone.
+generate_for_ecu_minimal_comparams(
+    ecu_name="JGWT5000",
+    logical_address=0x5000,
+    variants=[("App_0101", 0x000501)],
+    protocol_snref="DMC_DoIP",
+)
+
+generate_functional_groups("functional_groups.pdx")

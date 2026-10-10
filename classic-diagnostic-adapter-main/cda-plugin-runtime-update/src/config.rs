@@ -1,0 +1,48 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Copyright (c) Contributors to the Eclipse Foundation
+ *
+ * See the NOTICE file(s) distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Apache License Version 2.0 which is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Clone, schemars::JsonSchema, Debug)]
+pub struct RuntimeUpdateConfig {
+    /// Maximum upload body size in bytes for multipart file uploads.
+    /// Default: 50MB. Axum's built-in limit is 2MB which is too low for MDD files.
+    pub upload_body_limit_bytes: usize,
+    /// Directory where the updatable database is stored. Must exist: the CDA
+    /// waits for it to appear and never creates it.
+    /// If the CDA can start before the storage is mounted, point this to a
+    /// directory on the storage rather than its mount point, so that the wait
+    /// can tell an unmounted storage from an empty one.
+    pub storage_dir: String,
+    /// How long to wait between trying to load the storage directory,
+    /// if it is unavailable, in milliseconds.
+    pub storage_dir_load_retry_delay_ms: u64,
+    /// How many times to try loading the storage directory,
+    /// if it is unavailable.
+    pub storage_dir_load_retry_attempts: usize,
+    /// Value of the Retry-After header (in seconds) sent when the service is
+    /// temporarily unavailable due to a busy transaction.
+    pub retry_after_seconds: u64,
+}
+
+impl Default for RuntimeUpdateConfig {
+    fn default() -> Self {
+        Self {
+            upload_body_limit_bytes: 50 * 1024 * 1024, // 50 MB,
+            storage_dir: ".".to_owned(),
+            storage_dir_load_retry_delay_ms: 3000,
+            storage_dir_load_retry_attempts: 100,
+            retry_after_seconds: 1,
+        }
+    }
+}

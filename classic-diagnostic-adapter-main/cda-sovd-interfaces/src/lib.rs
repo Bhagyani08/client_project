@@ -1,0 +1,256 @@
+/*
+ * SPDX-FileCopyrightText: 2025 Copyright (c) Contributors to the Eclipse Foundation
+ *
+ * See the NOTICE file(s) distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Apache License Version 2.0 which is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+use cda_interfaces::HashMap;
+use serde::{Deserialize, Serialize};
+
+use crate::error::DataError;
+
+pub mod apps;
+pub mod components;
+pub mod docs;
+pub mod error;
+pub mod functions;
+pub mod locking;
+
+fn default_true() -> bool {
+    true
+}
+
+pub trait Payload {
+    fn get_data_map(&self) -> HashMap<String, serde_json::Value>;
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct Resource {
+    pub href: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub name: String,
+}
+
+#[derive(Deserialize, Serialize, Debug, schemars::JsonSchema)]
+pub struct Items<T> {
+    pub items: Vec<T>,
+    #[schemars(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<schemars::Schema>,
+}
+
+impl<T> Default for Items<T> {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            schema: None,
+        }
+    }
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ResourceResponse {
+    pub items: Vec<Resource>,
+    #[schemars(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<schemars::Schema>,
+}
+
+#[derive(Serialize, Debug, schemars::JsonSchema)]
+pub struct ObjectDataItem<T> {
+    pub id: String,
+    pub data: serde_json::Map<String, serde_json::Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<DataError<T>>,
+    #[schemars(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<schemars::Schema>,
+}
+
+#[derive(Deserialize, Serialize, Debug, schemars::JsonSchema)]
+pub struct ArrayDataItem {
+    pub id: String,
+    pub data: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize, Debug, schemars::JsonSchema)]
+pub struct IncludeSchemaQuery {
+    #[serde(rename = "include-schema", default)]
+    pub include_schema: bool,
+}
+
+pub mod sovd2uds {
+    use std::path::PathBuf;
+
+    pub use cda_interfaces::runtime_update_api::{BulkDataDescriptor, HashAlgorithm};
+    use serde::Serialize;
+
+    #[derive(Serialize, schemars::JsonSchema)]
+    pub struct FileList {
+        #[serde(rename = "items")]
+        pub files: Vec<BulkDataDescriptor>,
+        #[serde(skip_serializing)]
+        pub path: Option<PathBuf>,
+        #[schemars(skip)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub schema: Option<schemars::Schema>,
+    }
+}
+
+pub mod common {
+    pub mod operations {
+        use serde::{Deserialize, Serialize};
+
+        /// A single item in an operation IDs collection.
+        #[derive(Serialize, Deserialize, schemars::JsonSchema)]
+        pub struct OperationIdItem {
+            pub id: String,
+        }
+
+        /// A single item in an operations collection.
+        /// Spec Table 169 (`OperationDescription`).
+        #[derive(Serialize, Deserialize, schemars::JsonSchema)]
+        pub struct OperationCollectionItem {
+            /// Trimmed short-name used as the service identifier.
+            pub id: String,
+            /// Human-readable name from the database long-name.
+            pub name: String,
+            /// If `true`, the execution of the operation requires proof of co-location.
+            /// Always `false` for classic UDS routines.
+            pub proximity_proof_required: bool,
+            /// If `true`, the execution of the operation is asynchronous
+            /// (has Stop or `RequestResults`).
+            pub asynchronous_execution: bool,
+        }
+
+        /// Query parameters for
+        /// - `POST .../operations/{service}/executions`.
+        /// - `GET .../operations/{service}/executions/{id}`.
+        #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+        pub struct OperationQuery {
+            #[serde(rename = "include-schema", default)]
+            pub include_schema: bool,
+            /// When `true`, skip sending the UDS request to the ECU(s).
+            #[serde(rename = "x-sovd2uds-suppressService", default)]
+            pub suppress_service: bool,
+        }
+
+        /// Query parameters for `DELETE .../operations/{service}/executions/{id}`.
+        #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+        pub struct OperationDeleteQuery {
+            #[serde(rename = "include-schema", default)]
+            pub include_schema: bool,
+            /// When `true`, skip sending the UDS Stop (0x02) request to the ECU(s).
+            #[serde(rename = "x-sovd2uds-suppressService", default)]
+            pub suppress_service: bool,
+            /// When `true`, remove the execution entry even if the ECU Stop request failed.
+            #[serde(rename = "x-sovd2uds-force", default)]
+            pub force: bool,
+        }
+    }
+
+    pub mod modes {
+
+        pub const SESSION_NAME: &str = "Diagnostic session";
+        pub const SESSION_ID: &str = "session";
+        pub const SECURITY_NAME: &str = "Security access";
+        pub const SECURITY_ID: &str = "security";
+        pub const COMM_CONTROL_NAME: &str = "Communication control";
+        pub const COMM_CONTROL_ID: &str = "commctrl";
+
+        pub const DTC_SETTING_NAME: &str = "DTC setting";
+        pub const DTC_SETTING_ID: &str = "dtcsetting";
+
+        pub type Query = crate::IncludeSchemaQuery;
+        pub mod get {
+            use serde::{Deserialize, Serialize};
+
+            use crate::Items;
+
+            /// Used in the GET `/components/ecu/{ecu_id|functional_group}/modes/{mode_id}` endpoint
+            #[derive(Serialize, Deserialize, schemars::JsonSchema)]
+            pub struct Mode<T> {
+                /// The name of the mode, optional in accordance with sovd standard
+                pub name: Option<String>,
+                /// The translation ID for the name
+                #[serde(skip_serializing_if = "Option::is_none")]
+                pub translation_id: Option<String>,
+                /// The value of the mode.
+                #[serde(skip_serializing_if = "Option::is_none")]
+                pub value: Option<T>,
+                /// The schema of the mode resource.
+                #[schemars(skip)]
+                #[serde(skip_serializing_if = "Option::is_none")]
+                pub schema: Option<schemars::Schema>,
+            }
+
+            #[derive(Serialize, Deserialize, schemars::JsonSchema)]
+            pub struct ModeCollectionItem {
+                /// The resource identifier of the mode on an entity
+                pub id: String,
+                /// The name of the mode
+                #[serde(skip_serializing_if = "Option::is_none")]
+                pub name: Option<String>,
+                /// The translation ID for the name
+                #[serde(skip_serializing_if = "Option::is_none")]
+                pub translation_id: Option<String>,
+            }
+
+            pub type Response = Items<ModeCollectionItem>;
+        }
+
+        pub mod put {
+            use serde::{Deserialize, Serialize};
+
+            #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+            #[schemars(rename = "UpdateAccessModesResponse")]
+            pub struct Response<T> {
+                pub id: String,
+                pub value: T,
+                #[schemars(skip)]
+                #[serde(skip_serializing_if = "Option::is_none")]
+                pub schema: Option<schemars::Schema>,
+            }
+        }
+
+        pub mod commctrl {
+            pub mod put {
+                use cda_interfaces::HashMap;
+                use serde::{Deserialize, Serialize};
+
+                #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+                #[schemars(rename = "UpdateCommCtrlModesRequest")]
+                pub struct Request {
+                    /// Sub-function to enable/disable Rx/Tx communication
+                    pub value: String,
+                    /// Additional parameters, which will be passed directly to the ECU
+                    pub parameters: Option<HashMap<String, serde_json::Value>>,
+                }
+            }
+        }
+
+        pub mod dtcsetting {
+            pub mod put {
+                use cda_interfaces::HashMap;
+                use serde::{Deserialize, Serialize};
+
+                #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+                #[schemars(rename = "UpdateDtcSettingsModesRequest")]
+                pub struct Request {
+                    /// Enable/Disable DTCs
+                    pub value: String,
+                    /// Additional parameters, which will be passed directly to the ECU
+                    pub parameters: Option<HashMap<String, serde_json::Value>>,
+                }
+            }
+        }
+    }
+}

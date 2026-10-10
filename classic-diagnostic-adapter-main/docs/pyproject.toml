@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: 2026 Copyright (c) Contributors to the Eclipse Foundation
+#
+# See the NOTICE file(s) distributed with this work for additional
+# information regarding copyright ownership.
+#
+# This program and the accompanying materials are made available under the
+# terms of the Apache License Version 2.0 which is available at
+# https://www.apache.org/licenses/LICENSE-2.0
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[project]
+name = "cda-docs"
+version = "1.0.0"
+requires-python = ">=3.13"
+dependencies = [
+  "sphinx>=8.2,<9",
+  "sphinx-needs==8.1.1",
+  "sphinxcontrib-plantuml==0.31.0",
+  "sphinx-codelinks==1.2.0",
+  "myst-parser==5.0.0",
+  "furo>=2025.9.25",
+]
+
+[tool.uv.sources]
+sphinx-codelinks = { git = "https://github.com/useblocks/sphinx-codelinks.git", tag = "1.2.0" }

@@ -1,0 +1,628 @@
+/*
+ * SPDX-FileCopyrightText: 2025 Copyright (c) Contributors to the Eclipse Foundation
+ *
+ * See the NOTICE file(s) distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Apache License Version 2.0 which is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+use std::{sync::Arc, time::Duration};
+
+use aide::{axum::routing, swagger::Swagger};
+use axum::{
+    Json,
+    http::{self, Request},
+};
+use cda_comm_doip::DoipGatewaySetupError;
+use cda_interfaces::{
+    FunctionalDescriptionConfig, HashMap, SchemaProvider, UdsEcu,
+    communication_control::CommunicationAccess, datatypes::ComponentsConfig, dlt_ctx,
+    file_manager::FileManager, http_protection::registry::HttpRouteMatcher,
+};
+use cda_plugin_security::SecurityPluginLoader;
+use dynamic_router::DynamicRouter;
+pub use dynamic_router::{RouteGroupNotFound, RouteHandle};
+pub use http::Method;
+use opensovd_axum_extra::ExtractHost;
+use sovd::apps::sovd2uds::bulk_data::runtimefiles::RuntimeUpdateRouteState;
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
+use tower::{Layer, ServiceExt as TowerServiceExt};
+use tower_http::{normalize_path::NormalizePathLayer, trace::TraceLayer};
+
+/// Public API surface re-exported from the crate-internal `sovd` module.
+pub use crate::sovd::{
+    SovdLockStateProvider, error::VendorErrorCode, locks::Locks,
+    request_guard::install_http_restriction_guard, static_data::add_static_data_endpoint,
+};
+pub mod dynamic_router;
+mod openapi;
+pub(crate) mod sovd;
+
+// Consts for HTTP
+pub const SWAGGER_UI_ROUTE: &str = "/swagger-ui";
+pub const OPENAPI_JSON_ROUTE: &str = "/openapi.json";
+#[derive(Clone)]
+pub enum WebServerConfig {
+    /// Bind to this host/port over TCP.
+    Tcp { host: String, port: u16 },
+    /// Bind to this Unix domain socket path instead of TCP.
+    UnixSocket { path: String },
+}
+
+/// Static configuration for vehicle SOVD routes.
+pub struct VehicleConfig {
+    pub flash_files_path: String,
+    pub functional_group_config: FunctionalDescriptionConfig,
+    pub components_config: ComponentsConfig,
+}
+
+/// Runtime resources (handles, shared state) for vehicle SOVD routes.
+pub struct VehicleResources<T, M> {
+    pub ecu_uds: T,
+    pub file_managers: HashMap<String, M>,
+    pub locks: Arc<Locks>,
+    /// Access-only view used to admit diagnostic communication activities.
+    pub communication_access: Arc<dyn CommunicationAccess>,
+}
+
+/// [[ dimpl~sovd-api-http-server, Starts HTTP Server (TCP or Unix domain socket) ]]
+///
+/// Launches the http(s) webserver with deferred initialization
+///
+/// The server starts immediately with static endpoints. SOVD routes and other functionality
+/// can be added later by calling methods on the returned `DynamicRouter`.
+///
+/// # Errors
+/// Will return `Err` in case that the webserver couldn't be launched.
+/// This can be caused due to invalid config, ports or addresses already being in use.
+///
+#[tracing::instrument(skip(config, shutdown_signal))]
+pub async fn launch_webserver<F>(
+    config: WebServerConfig,
+    shutdown_signal: F,
+) -> Result<(DynamicRouter, tokio::task::JoinHandle<()>), DoipGatewaySetupError>
+where
+    F: Future<Output = ()> + Clone + Send + 'static,
+{
+    let dynamic_router = DynamicRouter::new();
+    let dynamic_router_for_service = dynamic_router.clone();
+    let service = tower::service_fn(move |request: Request<axum::body::Body>| {
+        let dr = dynamic_router_for_service.clone();
+        async move {
+            let router = dr.get_router().await;
+            TowerServiceExt::oneshot(router, request).await
+        }
+    });
+
+    let middleware = tower::util::MapRequestLayer::new(rewrite_request_uri);
+    let trim_trailing_slash_middleware = NormalizePathLayer::trim_trailing_slash();
+    let service_with_middleware = middleware.layer(trim_trailing_slash_middleware.layer(service));
+
+    let serve_future: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> = match config {
+        WebServerConfig::UnixSocket { path: socket_path } => {
+            #[cfg(unix)]
+            {
+                remove_stale_unix_socket(&socket_path)?;
+                let listener = UnixListener::bind(&socket_path).map_err(|e| {
+                    DoipGatewaySetupError::ServerError(format!(
+                        "Failed to bind to unix socket {socket_path}: {e}"
+                    ))
+                })?;
+                tracing::info!("SOVD HTTP server listening on unix socket {socket_path}");
+                Box::pin(async move {
+                    let _ =
+                        axum::serve(listener, tower::make::Shared::new(service_with_middleware))
+                            .with_graceful_shutdown(shutdown_signal)
+                            .await;
+                })
+            }
+            #[cfg(not(unix))]
+            {
+                return Err(DoipGatewaySetupError::ServerError(format!(
+                    "Unix domain sockets are not supported on this platform (requested path: \
+                     {socket_path})"
+                )));
+            }
+        }
+        WebServerConfig::Tcp { host, port } => {
+            let listen_address = format!("{host}:{port}");
+            let listener = TcpListener::bind(&listen_address).await.map_err(|e| {
+                DoipGatewaySetupError::ServerError(format!(
+                    "Failed to bind to {listen_address}: {e}"
+                ))
+            })?;
+            tracing::info!("SOVD HTTP server listening on {listen_address}");
+            Box::pin(async move {
+                let _ = axum::serve(listener, tower::make::Shared::new(service_with_middleware))
+                    .with_graceful_shutdown(shutdown_signal)
+                    .await;
+            })
+        }
+    };
+
+    let webserver_task = cda_interfaces::spawn_named!("webserver", serve_future);
+
+    Ok((dynamic_router, webserver_task))
+}
+
+/// Removes a pre-existing file at `socket_path`, if any, so that binding a
+/// fresh `UnixListener` there doesn't fail with `AddrInUse` because of a
+/// socket file left behind by a previous unclean shutdown.
+#[cfg(unix)]
+fn remove_stale_unix_socket(socket_path: &str) -> Result<(), DoipGatewaySetupError> {
+    match std::fs::remove_file(socket_path) {
+        Ok(()) => {
+            tracing::debug!("Removed stale unix socket file at {socket_path}");
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(DoipGatewaySetupError::ServerError(format!(
+            "Failed to remove stale unix socket file at {socket_path}: {e}"
+        ))),
+    }
+}
+
+/// Add vehicle routes to the dynamic router
+///
+/// This function should be called after the database is loaded to add all vehicle routes
+///
+/// # Errors
+/// Returns `Err` if routes cannot be added to the dynamic router.
+#[allow(
+    clippy::implicit_hasher,
+    reason = "Type alias doesn't allow specifying hasher"
+)]
+#[tracing::instrument(
+    skip(dynamic_router, config, resources),
+    fields(
+        flash_files_path = %config.flash_files_path
+    )
+)]
+pub async fn add_vehicle_routes<T, M, S>(
+    dynamic_router: &DynamicRouter,
+    config: VehicleConfig,
+    resources: VehicleResources<T, M>,
+) -> Result<RouteHandle, DoipGatewaySetupError>
+where
+    T: UdsEcu + SchemaProvider + Clone + Send + Sync + 'static,
+    M: FileManager + Send + Sync + 'static,
+    S: SecurityPluginLoader,
+{
+    let vehicle_router = build_vehicle_routes::<T, M, S>(config, resources).await;
+
+    let handle = dynamic_router.add_routes(vehicle_router).await;
+
+    tracing::info!("Vehicle routes added to webserver");
+    Ok(handle)
+}
+
+#[allow(
+    clippy::implicit_hasher,
+    reason = "Type alias doesn't allow specifying hasher"
+)]
+pub async fn build_vehicle_routes<T, M, S>(
+    config: VehicleConfig,
+    resources: VehicleResources<T, M>,
+) -> aide::axum::ApiRouter
+where
+    T: UdsEcu + SchemaProvider + Clone + Send + Sync + 'static,
+    M: FileManager + Send + Sync + 'static,
+    S: SecurityPluginLoader,
+{
+    sovd::route::<T, M, S>(
+        config.functional_group_config,
+        config.components_config,
+        &resources.ecu_uds,
+        config.flash_files_path,
+        resources.file_managers,
+        resources.locks,
+        resources.communication_access,
+    )
+    .await
+}
+
+/// Mounts the runtime-update HTTP routes onto the dynamic router and returns a handle to them.
+///
+/// Adds the runtime-file update endpoints to the router.
+pub async fn add_runtime_update_routes<S, P, L>(
+    dynamic_router: &DynamicRouter,
+    plugin: Arc<P>,
+    lock_state: Arc<L>,
+    upload_limit: usize,
+    retry_after: Duration,
+) -> RouteHandle
+where
+    S: SecurityPluginLoader,
+    P: cda_interfaces::runtime_update_api::RuntimeFilesUpdatePlugin,
+    L: cda_interfaces::runtime_update_api::LockStateProvider,
+{
+    let route_state = RuntimeUpdateRouteState {
+        plugin,
+        vehicle_lock_states: lock_state,
+        retry_after,
+    };
+    let bulk_data_router = sovd::apps::sovd2uds::bulk_data::runtimefiles::routes::<S, P, L>(
+        route_state.clone(),
+        upload_limit,
+    );
+    let operations_router =
+        sovd::apps::sovd2uds::operations::runtimefilesupdate::routes::<S, P, L>(route_state);
+    let router = bulk_data_router.merge(operations_router);
+    let handle = dynamic_router.add_routes(router.into()).await;
+    tracing::info!("Runtime update routes added to webserver");
+    handle
+}
+
+/// Routes that remain available while an update execution blocks other HTTP requests.
+#[must_use]
+pub fn routes_accessible_during_update() -> Vec<HttpRouteMatcher> {
+    sovd::apps::sovd2uds::operations::runtimefilesupdate::routes_accessible_during_update()
+}
+
+/// `OpenAPI` spec regenerates on every recomposition, reflecting current routes.
+///
+/// The server URL embedded in `openapi.json` is derived dynamically from each
+/// request's `Host` header (with `X-Forwarded-Host` / `Forwarded` taking
+/// precedence for reverse-proxy deployments), so the Swagger-UI always reflects
+/// the address the client actually used to reach CDA.
+pub async fn add_openapi_routes(dynamic_router: &DynamicRouter) {
+    let dr = dynamic_router.clone();
+    dynamic_router
+        .add_finalizer(Arc::new(move |router: axum::Router| -> axum::Router {
+            let dr = dr.clone();
+            let swagger_route: axum::routing::MethodRouter =
+                Swagger::new(OPENAPI_JSON_ROUTE).axum_route().into();
+            let openapi_route: axum::routing::MethodRouter =
+                routing::get(move |ExtractHost(host): ExtractHost| {
+                    let dr = dr.clone();
+                    async move {
+                        let mut api = (*dr.get_openapi().await).clone();
+                        let server_url = format!("http://{host}");
+                        let _ = openapi::api_docs(
+                            aide::transform::TransformOpenApi::new(&mut api),
+                            server_url,
+                        );
+                        Json(api)
+                    }
+                })
+                .into();
+            router
+                .route(SWAGGER_UI_ROUTE, swagger_route)
+                .route(OPENAPI_JSON_ROUTE, openapi_route)
+        }))
+        .await;
+}
+
+fn rewrite_request_uri<B>(mut req: Request<B>) -> Request<B> {
+    let uri = req.uri();
+    let decoded_path = percent_encoding::percent_decode_str(uri.path())
+        .decode_utf8()
+        .unwrap_or_else(|_| uri.path().into());
+    let normalized_path = decoded_path.to_lowercase();
+    let normalized_path_and_query = uri.query().map_or_else(
+        || normalized_path.clone(),
+        |query| format!("{normalized_path}?{query}"),
+    );
+
+    let new_uri = match normalized_path_and_query.parse() {
+        Ok(uri) => uri,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to parse URI, using original");
+            uri.clone()
+        }
+    };
+    *req.uri_mut() = new_uri;
+    req
+}
+
+fn create_trace_layer<S>(route: axum::Router<S>) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    route.layer(
+        TraceLayer::new_for_http()
+            .make_span_with(|request: &axum::http::Request<_>| {
+                tracing::info_span!(
+                        "request",
+                    method = ?request.method(),
+                        path = request.uri().to_string(),
+                        status_code = tracing::field::Empty,
+                        latency = tracing::field::Empty,
+                        error = tracing::field::Empty,
+                        dlt_context = dlt_ctx!("SOVD"),
+                )
+            })
+            .on_request(|request: &axum::http::Request<_>, _span: &tracing::Span| {
+                tracing::debug!(
+                    method = %request.method(),
+                    path = %request.uri(),
+                    "Request received"
+                );
+            })
+            .on_response(
+                |response: &axum::http::Response<_>,
+                 latency: std::time::Duration,
+                 span: &tracing::Span| {
+                    span.record("status_code", response.status().as_u16());
+                    span.record("latency", format!("{latency:?}"));
+                },
+            )
+            .on_failure(
+                |error: tower_http::classify::ServerErrorsFailureClass,
+                 latency: std::time::Duration,
+                 span: &tracing::Span| {
+                    span.record("latency", format!("{latency:?}"));
+                    if let tower_http::classify::ServerErrorsFailureClass::StatusCode(status) =
+                        error
+                    {
+                        span.record("status_code", status.as_u16());
+                        if status == http::StatusCode::BAD_GATEWAY {
+                            return; // Ignore 502 errors
+                        }
+                    }
+                    span.record("error", error.to_string());
+                    tracing::error!("HTTP request failed");
+                },
+            ),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    use super::{OPENAPI_JSON_ROUTE, add_openapi_routes, dynamic_router::DynamicRouter};
+
+    #[tokio::test]
+    async fn openapi_route_is_available_without_vehicle_routes() {
+        let dynamic_router = DynamicRouter::new();
+        add_openapi_routes(&dynamic_router).await;
+
+        let response = dynamic_router
+            .get_router()
+            .await
+            .oneshot(
+                Request::builder()
+                    .uri(OPENAPI_JSON_ROUTE)
+                    .header("host", "127.0.0.1:20002")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_utils {
+    use serde::de::DeserializeOwned;
+
+    pub(crate) async fn axum_response_into<T: DeserializeOwned>(
+        response: axum::response::Response,
+    ) -> Result<T, serde_json::Error> {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice::<T>(body.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod uri_rewrite_tests {
+    use axum::{body::Body, extract::Query};
+    use sovd_interfaces::components::ecu::operations::{OperationDeleteQuery, OperationQuery};
+    use tower::ServiceExt;
+
+    use super::*;
+
+    async fn rewrite_uri(uri: &str) -> http::Uri {
+        let service = tower::service_fn(|request: Request<Body>| async move {
+            Ok::<_, std::convert::Infallible>(request.uri().clone())
+        });
+        let service = tower::util::MapRequestLayer::new(rewrite_request_uri).layer(service);
+        let request = Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("failed to build request");
+
+        service
+            .oneshot(request)
+            .await
+            .expect("URI rewrite service failed")
+    }
+
+    #[tokio::test]
+    async fn rewrite_request_uri_normalizes_only_path() {
+        let uri =
+            rewrite_uri("/Vehicle/%45CU?x-sovd2uds-suppressService=true&caseSensitive=AbC%26X%3DY")
+                .await;
+
+        assert_eq!(uri.path(), "/vehicle/ecu");
+        assert_eq!(
+            uri.query(),
+            Some("x-sovd2uds-suppressService=true&caseSensitive=AbC%26X%3DY")
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_request_uri_preserves_operation_queries() {
+        let uri = rewrite_uri(concat!(
+            "/Vehicle/v15/components/ECU/operations/Routine/executions/id",
+            "?x-sovd2uds-suppressService=true"
+        ))
+        .await;
+        let Query(query) = Query::<OperationQuery>::try_from_uri(&uri)
+            .expect("failed to deserialize operation query");
+        let Query(delete_query) = Query::<OperationDeleteQuery>::try_from_uri(&uri)
+            .expect("failed to deserialize operation delete query");
+
+        assert!(query.suppress_service);
+        assert!(delete_query.suppress_service);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod webserver_bind_tests {
+    use std::time::Duration;
+
+    use futures::FutureExt;
+
+    use super::*;
+
+    /// Sends a GET request over a Unix domain socket using `reqwest` (the
+    /// same HTTP client used elsewhere in this crate and in the integration
+    /// tests) and returns the response status code. Used instead of parsing
+    /// raw bytes off a `UnixStream`, so the tests exercise a spec-compliant
+    /// HTTP client the same way a real consumer of the Unix socket transport
+    /// would.
+    async fn get_over_unix_socket(socket_path: &str, path: &str) -> http::StatusCode {
+        let client = reqwest::Client::builder()
+            .unix_socket(socket_path)
+            .build()
+            .expect("failed to build unix socket client");
+
+        let response = client
+            .get(format!("http://localhost{path}"))
+            .send()
+            .await
+            .expect("failed to send request over unix socket");
+        http::StatusCode::from_u16(response.status().as_u16())
+            .expect("response returned an invalid status code")
+    }
+
+    fn shutdown_channel() -> (
+        tokio::sync::broadcast::Sender<()>,
+        impl Future<Output = ()> + Clone + Send + 'static,
+    ) {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<()>(1);
+        let signal = async move {
+            rx.recv().await.ok();
+        }
+        .shared();
+        (tx, signal)
+    }
+
+    /// Creates a temp directory and a `WebServerConfig::UnixSocket` pointing
+    /// at a socket file inside it. The returned `TempDir` must be kept alive
+    /// for as long as the socket path is used.
+    fn temp_socket_config() -> (tempfile::TempDir, String, WebServerConfig) {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let socket_path = dir.path().join("cda.sock").to_string_lossy().to_string();
+        let config = WebServerConfig::UnixSocket {
+            path: socket_path.clone(),
+        };
+        (dir, socket_path, config)
+    }
+
+    /// Asserts that `socket_path` is reachable (a request gets routed through
+    /// the dynamic router, even if it 404s because no routes are registered),
+    /// then signals shutdown and waits for `webserver_task` to finish.
+    async fn assert_reachable_then_shutdown(
+        socket_path: &str,
+        shutdown_tx: tokio::sync::broadcast::Sender<()>,
+        webserver_task: tokio::task::JoinHandle<()>,
+    ) {
+        // No routes are registered, so the dynamic router responds with 404 -
+        // that's fine, we only need to confirm the connection was accepted
+        // and routed.
+        let status = get_over_unix_socket(socket_path, "/").await;
+        assert_eq!(status, http::StatusCode::NOT_FOUND);
+
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(Duration::from_secs(5), webserver_task)
+            .await
+            .expect("webserver task didn't shut down in time")
+            .expect("webserver task panicked");
+    }
+
+    /// [[ test~sovd-api-http-server-unix-socket-bind, Binds the server to a unix domain socket and reaches it, test ]]
+    #[tokio::test]
+    async fn launch_webserver_binds_unix_socket() {
+        let (_dir, socket_path, config) = temp_socket_config();
+        let (shutdown_tx, shutdown_signal) = shutdown_channel();
+
+        let (_dynamic_router, webserver_task) = launch_webserver(config, shutdown_signal)
+            .await
+            .expect("failed to launch webserver on unix socket");
+
+        assert_reachable_then_shutdown(&socket_path, shutdown_tx, webserver_task).await;
+    }
+
+    /// [[ test~sovd-api-http-server-tcp-bind, Binds the server to a TCP host/port and reaches it, test ]]
+    #[tokio::test]
+    async fn launch_webserver_binds_tcp() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to reserve a tcp port");
+        let tcp_port = tcp_listener.local_addr().unwrap().port();
+        drop(tcp_listener);
+
+        let config = WebServerConfig::Tcp {
+            host: "127.0.0.1".to_owned(),
+            port: tcp_port,
+        };
+        let (shutdown_tx, shutdown_signal) = shutdown_channel();
+
+        let (_dynamic_router, webserver_task) = launch_webserver(config, shutdown_signal)
+            .await
+            .expect("failed to launch webserver on tcp");
+
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://127.0.0.1:{tcp_port}/"))
+            .send()
+            .await
+            .expect("failed to send request over tcp");
+        assert_eq!(response.status().as_u16(), http::StatusCode::NOT_FOUND);
+
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(Duration::from_secs(5), webserver_task)
+            .await
+            .expect("webserver task didn't shut down in time")
+            .expect("webserver task panicked");
+    }
+
+    /// [[ test~sovd-api-http-server-unix-socket-stale-cleanup, Removes a stale unix socket file left by an unclean shutdown before binding, test ]]
+    #[tokio::test]
+    async fn launch_webserver_removes_stale_unix_socket_file() {
+        let (_dir, socket_path, config) = temp_socket_config();
+
+        // Simulate a leftover socket file from a previous unclean shutdown.
+        std::fs::write(&socket_path, b"stale").expect("failed to create stale socket file");
+
+        let (shutdown_tx, shutdown_signal) = shutdown_channel();
+
+        let (_dynamic_router, webserver_task) = launch_webserver(config, shutdown_signal)
+            .await
+            .expect("failed to launch webserver despite stale socket file");
+
+        assert_reachable_then_shutdown(&socket_path, shutdown_tx, webserver_task).await;
+    }
+
+    /// [[ test~sovd-api-http-server-unix-socket-stale-cleanup-failure, Fails cleanly when a stale unix socket path can't be removed, test ]]
+    #[tokio::test]
+    async fn launch_webserver_fails_if_stale_socket_cannot_be_removed() {
+        let (_dir, socket_path, config) = temp_socket_config();
+        // A directory can't be removed with `remove_file`, so binding must fail
+        // with a clear error instead of silently misbehaving.
+        std::fs::create_dir(&socket_path).expect("failed to create directory");
+
+        let (_shutdown_tx, shutdown_signal) = shutdown_channel();
+
+        let result = launch_webserver(config, shutdown_signal).await;
+        assert!(
+            result.is_err(),
+            "expected launch_webserver to fail when the stale socket path is a directory"
+        );
+    }
+}

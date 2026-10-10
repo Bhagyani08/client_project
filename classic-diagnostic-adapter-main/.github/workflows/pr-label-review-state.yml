@@ -1,0 +1,190 @@
+# SPDX-FileCopyrightText: 2026 Copyright (c) Contributors to the Eclipse Foundation
+#
+# See the NOTICE file(s) distributed with this work for additional
+# information regarding copyright ownership.
+#
+# This program and the accompanying materials are made available under the
+# terms of the Apache License Version 2.0 which is available at
+# https://www.apache.org/licenses/LICENSE-2.0
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: PR Review Labels
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, review_requested, ready_for_review, converted_to_draft]
+  pull_request_review:
+    types: [submitted, dismissed]
+  pull_request_review_comment:
+    types: [created, deleted]
+  workflow_run:
+    workflows: ["Rust CI"]
+    types: [completed]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  update-review-labels:
+    runs-on: ubuntu-latest
+    name: "Update review state labels"
+    steps:
+      - name: Update review state labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request?.number
+              || context.payload.review?.pull_request?.number
+              || context.payload.workflow_run?.pull_requests?.[0]?.number;
+
+            if (!prNumber) {
+              core.info('No PR number found, skipping.');
+              return;
+            }
+
+            const NEEDS_REVIEW = 'needs review';
+            const CHANGES_REQUESTED = 'changes requested';
+            const READY_TO_MERGE = 'ready to merge';
+
+            async function addLabel(label) {
+              try {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  labels: [label],
+                });
+                core.info(`Added label: "${label}"`);
+              } catch (e) {
+                core.warning(`Failed to add label "${label}": ${e.message}`);
+              }
+            }
+
+            async function removeLabel(label) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  name: label,
+                });
+                core.info(`Removed label: "${label}"`);
+              } catch (e) {
+                if (e.status !== 404) {
+                  core.warning(`Failed to remove label "${label}": ${e.message}`);
+                }
+              }
+            }
+
+            if (context.eventName === 'workflow_run') {
+              if (context.payload.workflow_run.conclusion === 'failure') {
+                core.info('Rust CI failed; removing the needs review label.');
+                await removeLabel(NEEDS_REVIEW);
+              } else {
+                core.info('Rust CI did not fail.');
+              }
+              return;
+            }
+
+            const { data: reviews } = await github.rest.pulls.listReviews({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            const latestByReviewer = {};
+            for (const review of reviews) {
+              if (review.state === 'COMMENTED' || review.state === 'DISMISSED') continue;
+              latestByReviewer[review.user.login] = review.state;
+            }
+
+            const states = Object.values(latestByReviewer);
+            const hasChangesRequested = states.includes('CHANGES_REQUESTED');
+            const allApproved = states.length > 0
+              && states.every(s => s === 'APPROVED');
+
+            const { repository } = await github.graphql(`
+              query($owner: String!, $repo: String!, $pr: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $pr) {
+                    isDraft
+                    author { login }
+                    reviewThreads(first: 100) {
+                      nodes {
+                        isResolved
+                        comments(first: 100) {
+                          nodes { author { login } }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pr: prNumber,
+            });
+
+            const pr = repository.pullRequest;
+            const isDraft = pr.isDraft;
+            const prAuthor = pr.author?.login;
+
+            const unresolvedThreads = pr.reviewThreads.nodes
+              .filter(thread => !thread.isResolved);
+            const hasUnresolvedThreads = unresolvedThreads.length > 0;
+
+            // Threads needing a reply: started by someone other than the PR author
+            const threadsNeedingReply = unresolvedThreads.filter(thread => {
+              const firstComment = thread.comments.nodes[0];
+              return firstComment?.author?.login !== prAuthor;
+            });
+            const authorRepliedToAll = threadsNeedingReply.length === 0
+              || threadsNeedingReply.every(thread =>
+                thread.comments.nodes.some(c => c.author?.login === prAuthor)
+              );
+
+            if (isDraft) {
+              core.info('PR is a draft, removing review labels.');
+              await removeLabel(NEEDS_REVIEW);
+              await removeLabel(CHANGES_REQUESTED);
+              await removeLabel(READY_TO_MERGE);
+              return;
+            }
+
+            const eventName = context.eventName;
+            const action = context.payload.action;
+
+            if (eventName === 'pull_request_review' && action === 'submitted'
+                && context.payload.review.state === 'changes_requested') {
+              await addLabel(CHANGES_REQUESTED);
+              await removeLabel(NEEDS_REVIEW);
+              await removeLabel(READY_TO_MERGE);
+
+            } else if (allApproved && !hasUnresolvedThreads) {
+              await addLabel(READY_TO_MERGE);
+              await removeLabel(NEEDS_REVIEW);
+              await removeLabel(CHANGES_REQUESTED);
+
+            } else if (eventName === 'pull_request_target' && action === 'synchronize') {
+              await addLabel(NEEDS_REVIEW);
+              await removeLabel(CHANGES_REQUESTED);
+              await removeLabel(READY_TO_MERGE);
+
+            } else if (hasUnresolvedThreads && authorRepliedToAll) {
+              // Author replied to every reviewer thread - ready for re-review
+              await addLabel(NEEDS_REVIEW);
+              await removeLabel(CHANGES_REQUESTED);
+              await removeLabel(READY_TO_MERGE);
+
+            } else if (hasUnresolvedThreads) {
+              await addLabel(CHANGES_REQUESTED);
+              await removeLabel(NEEDS_REVIEW);
+              await removeLabel(READY_TO_MERGE);
+
+            } else {
+              await addLabel(NEEDS_REVIEW);
+              await removeLabel(CHANGES_REQUESTED);
+              await removeLabel(READY_TO_MERGE);
+            }

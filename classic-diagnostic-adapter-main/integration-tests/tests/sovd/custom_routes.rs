@@ -1,0 +1,253 @@
+/*
+ * SPDX-FileCopyrightText: 2025 Copyright (c) Contributors to the Eclipse Foundation
+ *
+ * See the NOTICE file(s) distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Apache License Version 2.0 which is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+use std::sync::Arc;
+
+use aide::axum::{ApiRouter, routing};
+use axum::{Json, http::StatusCode};
+use cda_sovd::dynamic_router::DynamicRouter;
+use futures::FutureExt;
+use opensovd_cda_lib::{cda_version, config::configfile::ServerTransport};
+use reqwest::Method;
+use serde::{Deserialize, Serialize};
+
+use crate::util::{
+    TestingError,
+    http::{Response, response_to_t},
+    runtime::{find_available_tcp_port, host, wait_for_cda_online},
+};
+
+const MAIN_HEALTH_COMPONENT_KEY: &str = "main";
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema, Clone, Debug, PartialEq)]
+struct TestData {
+    oem_name: String,
+    version: String,
+}
+
+async fn add_custom_routes(dynamic_router: &DynamicRouter) {
+    let custom_router = ApiRouter::new().api_route(
+        "/test",
+        routing::get_with(
+            || async {
+                (
+                    StatusCode::OK,
+                    Json(TestData {
+                        oem_name: "Eclipse Foundation".to_string(),
+                        version: "1.0.0".to_string(),
+                    }),
+                )
+            },
+            |op| {
+                // OpenAPI documentation for the GET /demo endpoint
+                op.description("Get demo data")
+                    .response_with::<200, Json<TestData>, _>(|res| {
+                        res.example(TestData {
+                            oem_name: "Eclipse Foundation".to_string(),
+                            version: "1.0.0".to_string(),
+                        })
+                    })
+            },
+        )
+        .post_with(
+            |Json(payload): Json<TestData>| async move {
+                // Echo back the payload
+                (StatusCode::CREATED, Json(payload))
+            },
+            |op| {
+                op.description("Create demo data")
+                    .response_with::<201, Json<TestData>, _>(|res| {
+                        res.description("Successfully created")
+                    })
+            },
+        ),
+    );
+
+    dynamic_router.add_routes(custom_router).await;
+}
+
+fn shutdown_channel() -> (
+    tokio::sync::broadcast::Sender<()>,
+    impl Future<Output = ()> + Clone + Send + 'static,
+) {
+    let (tx, mut rx) = tokio::sync::broadcast::channel::<()>(1);
+    let signal = async move {
+        rx.recv().await.ok();
+    }
+    .shared();
+    (tx, signal)
+}
+
+async fn shutdown_and_join(
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    webserver_join_handle: tokio::task::JoinHandle<()>,
+) {
+    shutdown_tx.send(()).ok();
+    webserver_join_handle
+        .await
+        .expect("Failed to shutdown webserver");
+}
+
+/// Exercises the `/test` demo endpoint via `get`/`post` (parameterized so
+/// callers can send the requests over TCP or a Unix domain socket) and
+/// asserts on the round-tripped `TestData` payloads.
+async fn assert_demo_endpoint_get_post<GetFut>(
+    get: impl FnOnce() -> GetFut,
+    post: impl FnOnce(String) -> futures::future::BoxFuture<'static, Result<Response, TestingError>>,
+) where
+    GetFut: Future<Output = Result<Response, TestingError>>,
+{
+    let get_response = get().await.expect("GET request failed");
+    let demo_data: TestData = response_to_t(&get_response).expect("Failed to parse GET response");
+    assert_eq!(demo_data.oem_name, "Eclipse Foundation");
+    assert_eq!(demo_data.version, "1.0.0");
+
+    let post_payload = TestData {
+        oem_name: "Custom OEM".to_string(),
+        version: "2.0.0".to_string(),
+    };
+    let post_body = serde_json::to_string(&post_payload).expect("Failed to serialize payload");
+    let post_response = post(post_body).await.expect("POST request failed");
+
+    let response_data: TestData =
+        response_to_t(&post_response).expect("Failed to parse POST response");
+    assert_eq!(response_data, post_payload);
+}
+
+#[tokio::test]
+async fn test_custom_demo_endpoint() {
+    // Use loopback since we don't need actual ECU connections for this test
+    let host = host();
+    let test_port = find_available_tcp_port(&host).expect("Failed to find available port");
+
+    let webserver_config = cda_sovd::WebServerConfig::Tcp {
+        host: host.clone(),
+        port: test_port,
+    };
+
+    let (shutdown_tx, shutdown_signal) = shutdown_channel();
+
+    let (dynamic_router, webserver_join_handle) =
+        cda_sovd::launch_webserver(webserver_config, shutdown_signal.clone())
+            .await
+            .expect("Failed to launch webserver");
+
+    let health = cda_health::add_health_routes(&dynamic_router, cda_version().to_owned()).await;
+    let main_health_provider = {
+        let provider = Arc::new(cda_health::StatusHealthProvider::new(
+            cda_health::Status::Starting,
+        ));
+        health
+            .register_provider(
+                MAIN_HEALTH_COMPONENT_KEY,
+                Arc::clone(&provider) as Arc<dyn cda_health::HealthStatus>,
+            )
+            .await
+            .expect("Failed to register main health provider");
+        provider
+    };
+
+    // Add custom routes directly. No vehicle routes are needed for this test.
+    add_custom_routes(&dynamic_router).await;
+
+    main_health_provider
+        .update_status(cda_health::Status::Up)
+        .await;
+
+    let url = reqwest::Url::parse(&format!("http://{host}:{test_port}/test")).expect("Invalid URL");
+    wait_for_cda_online(&ServerTransport::Tcp {
+        address: host,
+        port: test_port,
+        unix_socket: None,
+    })
+    .await
+    .expect("Webserver did not start in time");
+
+    assert_demo_endpoint_get_post(
+        || crate::util::http::send_request(StatusCode::OK, Method::GET, None, None, url.clone()),
+        |body| {
+            let url = url.clone();
+            async move {
+                crate::util::http::send_request(
+                    StatusCode::CREATED,
+                    Method::POST,
+                    Some(&body),
+                    None,
+                    url,
+                )
+                .await
+            }
+            .boxed()
+        },
+    )
+    .await;
+
+    shutdown_and_join(shutdown_tx, webserver_join_handle).await;
+}
+
+/// [[ itest~sovd-api-http-server-unix-socket, End-to-end GET/POST over a Unix domain socket bound webserver, itest ]]
+#[cfg(unix)]
+#[tokio::test]
+async fn test_custom_demo_endpoint_over_unix_socket() {
+    let socket_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let socket_path = socket_dir
+        .path()
+        .join("cda.sock")
+        .to_string_lossy()
+        .to_string();
+
+    let webserver_config = cda_sovd::WebServerConfig::UnixSocket {
+        path: socket_path.clone(),
+    };
+
+    let (shutdown_tx, shutdown_signal) = shutdown_channel();
+
+    let (dynamic_router, webserver_join_handle) =
+        cda_sovd::launch_webserver(webserver_config, shutdown_signal.clone())
+            .await
+            .expect("Failed to launch webserver");
+
+    // Add custom routes directly. No vehicle routes or health checks are
+    // needed for this test since we talk to the raw socket directly instead
+    // of polling the health endpoint for readiness.
+    add_custom_routes(&dynamic_router).await;
+
+    assert_demo_endpoint_get_post(
+        || {
+            crate::util::http::send_unix_socket_request(
+                &socket_path,
+                "/test",
+                StatusCode::OK,
+                Method::GET,
+                None,
+            )
+        },
+        |body| {
+            let socket_path = socket_path.clone();
+            async move {
+                crate::util::http::send_unix_socket_request(
+                    &socket_path,
+                    "/test",
+                    StatusCode::CREATED,
+                    Method::POST,
+                    Some(&body),
+                )
+                .await
+            }
+            .boxed()
+        },
+    )
+    .await;
+
+    shutdown_and_join(shutdown_tx, webserver_join_handle).await;
+}

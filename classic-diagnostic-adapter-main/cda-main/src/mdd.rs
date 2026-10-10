@@ -1,0 +1,782 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Copyright (c) Contributors to the Eclipse Foundation
+ *
+ * See the NOTICE file(s) distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Apache License Version 2.0 which is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use cda_core::{EcuManager, EcuManagerConfig};
+use cda_database::{
+    FileManager, ProtoLoadConfig,
+    storage::{DatabaseLocation, current_database_location},
+    update_mdd_uncompressed,
+};
+use cda_interfaces::{
+    EcuAddresses, EcuManager as EcuManagerTrait, EcuManagerType, FunctionalDescriptionConfig,
+    HashMap, HashMapEntry, HashMapExtensions, HashSet, Protocol,
+    datatypes::{ComParams, DatabaseNamingConvention, FlatbBufConfig},
+    file_manager::{Chunk, ChunkType},
+    health::HealthProvider,
+    storage_api::{Collection, DirectFileAccess},
+};
+use cda_plugin_security::SecurityPlugin;
+use cda_storage::LocalStorage;
+use tokio::sync::RwLock;
+
+use crate::{
+    AppError,
+    config::configfile::{Configuration, EcuConfig},
+    vehicle::{DatabaseMap, FileManagerMap},
+};
+
+pub(crate) const DB_HEALTH_COMPONENT_KEY: &str = "database";
+
+#[derive(Debug, thiserror::Error)]
+pub enum MddLoadingError {
+    #[error("Failed to load MDD {path} for ECU {ecu}: {reason}")]
+    LoadFailed {
+        path: String,
+        ecu: String,
+        reason: String,
+    },
+    #[error("Failed to decompress MDD {path}: {reason}")]
+    DecompressFailed { path: String, reason: String },
+    #[error("Invalid per-ECU com_params for ECU {ecu}")]
+    ComParamsInvalid { ecu: String },
+    #[error("Failed to create ECU manager for ECU {ecu}: {reason}")]
+    EcuManagerFailed { ecu: String, reason: String },
+}
+
+pub const PROTO_LOAD_CONFIG: &[ProtoLoadConfig; 4] = &[
+    ProtoLoadConfig {
+        type_: ChunkType::DiagnosticDescription,
+        load_data: true,
+        name: None,
+    },
+    ProtoLoadConfig {
+        type_: ChunkType::CodeFile,
+        load_data: false,
+        name: None,
+    },
+    ProtoLoadConfig {
+        type_: ChunkType::CodeFilePartial,
+        load_data: false,
+        name: None,
+    },
+    ProtoLoadConfig {
+        type_: ChunkType::EmbeddedFile,
+        load_data: false,
+        name: None,
+    },
+];
+
+#[derive(Debug)]
+pub(crate) struct EcuMetadata {
+    pub(crate) mdd_path: String,
+    pub(crate) valid: bool,
+}
+
+/// Configuration context for loading a single ECU database.
+struct EcuLoadContext<'a> {
+    mdd_path: String,
+    mddfile: &'a PathBuf,
+    ecu_name: String,
+    flat_buf_settings: &'a FlatbBufConfig,
+    database_config: &'a cda_database::DatabaseConfig,
+    ecu_config_map: &'a Arc<HashMap<String, EcuConfig>>,
+    database_naming_convention: DatabaseNamingConvention,
+    func_description_cfg: &'a FunctionalDescriptionConfig,
+    protocol: &'a Protocol,
+    com_params: &'a Arc<ComParams>,
+    fallback_to_base_variant: bool,
+    strict_parameter_validation: bool,
+}
+
+/// Result of building an ECU manager and associated metadata.
+struct EcuLoadResult<S: SecurityPlugin> {
+    manager: EcuManager<S>,
+    files: Vec<Chunk>,
+}
+
+pub(crate) type LoadedEcuMap<S> = HashMap<String, (EcuManager<S>, EcuMetadata)>;
+
+/// Loads MDD database files into memory and returns the database and file-manager maps.
+///
+/// # Errors
+/// Returns [`AppError`] if any database file fails to parse or initialize.
+#[tracing::instrument(
+    skip(config, mdd_paths, db_health_provider),
+    fields(database_count = mdd_paths.len())
+)]
+pub async fn load_databases<S: SecurityPlugin>(
+    config: &Configuration,
+    mdd_paths: &[PathBuf],
+    db_health_provider: Option<&Arc<dyn HealthProvider>>,
+) -> Result<(DatabaseMap<S>, FileManagerMap), AppError> {
+    if let Some(provider) = db_health_provider {
+        provider.set_status(cda_health::Status::Starting).await;
+    }
+    let start = std::time::Instant::now();
+
+    let ecu_config_map: HashMap<String, EcuConfig> = config
+        .ecu
+        .iter()
+        .map(|(k, v)| (k.to_lowercase(), v.clone()))
+        .collect();
+
+    let protocol = cda_interfaces::Protocol::new(config.doip.protocol_name.clone());
+
+    let mut loaded_ecus: LoadedEcuMap<S> = HashMap::new();
+    let mut file_managers_map: HashMap<String, FileManager> = HashMap::new();
+
+    for path in mdd_paths {
+        let (ecu_name, ecu_manager, file_manager) =
+            match load_single_mdd::<S>(path, config, &ecu_config_map, &protocol) {
+                Ok(result) => result,
+                Err(e) if config.database.ignore_invalid_mdd => {
+                    tracing::warn!(path = %path.display(), error = %e, "Skipping invalid MDD file");
+                    continue;
+                }
+                Err(e) => {
+                    if let Some(provider) = db_health_provider {
+                        provider.set_status(cda_health::Status::Failed).await;
+                    }
+                    return Err(AppError::DataError(e.to_string()));
+                }
+            };
+
+        let mdd_path = path.to_str().unwrap_or_default().to_owned();
+        insert_or_update_ecu(
+            &mut loaded_ecus,
+            &ecu_name,
+            ecu_manager,
+            EcuMetadata {
+                mdd_path,
+                valid: true,
+            },
+        );
+        file_managers_map.insert(ecu_name, file_manager);
+    }
+
+    let databases: DatabaseMap<S> = loaded_ecus
+        .into_iter()
+        .filter(|(_, (_, meta))| meta.valid)
+        .map(
+            |(k, (ecu_manager, _)): (String, (EcuManager<S>, EcuMetadata))| {
+                (k.to_lowercase(), RwLock::new(ecu_manager))
+            },
+        )
+        .collect();
+
+    mark_duplicate_ecus_by_address(&databases).await;
+
+    let file_managers: FileManagerMap = file_managers_map
+        .into_iter()
+        .filter(|(k, _): &(String, FileManager)| databases.contains_key(&k.to_lowercase()))
+        .map(|(k, v): (String, FileManager)| (k.to_lowercase(), v))
+        .collect();
+
+    handle_ecu_config_keys(&ecu_config_map, &databases, config.strict.ecu_config())?;
+
+    let end = std::time::Instant::now();
+    tracing::info!(
+        database_count = databases.len(),
+        duration = ?end.saturating_duration_since(start),
+        "Loaded databases"
+    );
+
+    // When `exit_no_database_loaded = false` the operator has explicitly opted
+    // into running without any ECU databases.  Marking health `Failed` in that
+    // case would block the readiness probe forever, so treat empty-but-allowed
+    // as `Up`.
+    let status = if databases.is_empty() && config.database.exit_no_database_loaded {
+        cda_health::Status::Failed
+    } else {
+        cda_health::Status::Up
+    };
+    if let Some(provider) = db_health_provider {
+        provider.set_status(status).await;
+    }
+
+    Ok((databases, file_managers))
+}
+
+/// Returns paths to the current MDD files, see
+/// [`current_databases`](current_database_location): the storage once
+/// an update seeded it, even when it is empty, otherwise the configured `database.dir`.
+pub async fn resolve_mdd_paths(storage: &LocalStorage, database_dir: &str) -> Vec<PathBuf> {
+    let paths = match current_database_location(storage, Path::new(database_dir)).await {
+        Ok(DatabaseLocation::Storage(collection)) => {
+            let paths = mdd_paths_in_collection(&*collection).await;
+            tracing::info!(
+                count = paths.len(),
+                "Using MDD files from CDA storage (overrides configured database dir)."
+            );
+            paths
+        }
+        Ok(DatabaseLocation::Dir(paths)) => {
+            tracing::info!(
+                database_dir = %database_dir,
+                "Storage not seeded yet, using configured database dir."
+            );
+            paths
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to determine the current MDD files.");
+            return vec![];
+        }
+    };
+    sort_by_largest_first(paths)
+}
+
+/// Returns the paths of all MDD files in `collection`, skipping those that cannot be resolved.
+async fn mdd_paths_in_collection(
+    collection: &(impl Collection + DirectFileAccess),
+) -> Vec<PathBuf> {
+    let keys = match collection.list().await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to list DiagnosticDatabase collection");
+            return vec![];
+        }
+    };
+
+    keys.iter()
+        .filter_map(|k| match collection.file_path(k) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(key = %k, error = %e,
+                "Failed to resolve MDD path in storage, skipping");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Sorts `paths` by file size, largest first.
+fn sort_by_largest_first(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut sized: Vec<(PathBuf, u64)> = paths
+        .into_iter()
+        .map(|path| {
+            let size = std::fs::metadata(&path).map_or(0, |m| m.len());
+            (path, size)
+        })
+        .collect();
+    sized.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
+    sized.into_iter().map(|(path, _)| path).collect()
+}
+
+pub(crate) fn handle_ecu_config_keys<S: SecurityPlugin>(
+    ecu_config_map: &HashMap<String, EcuConfig>,
+    databases: &HashMap<String, RwLock<EcuManager<S>>>,
+    strict: bool,
+) -> Result<(), AppError> {
+    let mut unmatched = Vec::new();
+    for ecu_key in ecu_config_map.keys() {
+        if !databases.contains_key(ecu_key) {
+            tracing::warn!(
+                ecu_name = %ecu_key,
+                "Per-ECU config entry does not match any loaded MDD database - ignored"
+            );
+            unmatched.push(ecu_key.clone());
+        }
+    }
+    if strict && !unmatched.is_empty() {
+        return Err(AppError::ConfigurationError {
+            message: format!(
+                "[strict] ecu_config is enabled and the following per-ECU config entries do not \
+                 match any loaded database: {}",
+                unmatched.join(", ")
+            ),
+            source: None,
+        });
+    }
+    Ok(())
+}
+
+/// The transport target an ECU description talks to, as far as duplicate
+/// detection is concerned: several ECU descriptions sharing one target are
+/// candidate models of the same physical node (e.g. the radio variants of a
+/// vehicle), and variant detection decides which one is actually installed.
+#[derive(Hash, PartialEq, Eq)]
+enum DuplicateTargetKey {
+    /// Resolved `DoIP` gateway/logical address pair.
+    Doip { gateway: u16, logical: u16 },
+    /// CAN arbitration ID pair from the MDD com-params, for ECUs without
+    /// resolved `DoIP` addressing (e.g. CAN-only databases).
+    Can(cda_interfaces::CanIds),
+}
+
+/// Scans `databases` for ECUs sharing the same transport target - the
+/// resolved `DoIP` gateway/logical address pair, or (for ECUs without `DoIP`
+/// addressing) the CAN arbitration ID pair from the MDD com-params - and
+/// marks them as duplicates of each other by calling
+/// `set_duplicating_ecu_names` on each affected manager.
+async fn mark_duplicate_ecus_by_address<S: SecurityPlugin>(
+    databases: &HashMap<String, RwLock<EcuManager<S>>>,
+) {
+    use cda_interfaces::CanComParamProvider as _;
+
+    let mut ecus_by_target: HashMap<DuplicateTargetKey, Vec<String>> = HashMap::new();
+    for (name, db_lock) in databases {
+        let db = db_lock.read().await;
+        let key = if db.doip_addresses_resolved() {
+            DuplicateTargetKey::Doip {
+                gateway: db.logical_gateway_address(),
+                logical: db.logical_address(),
+            }
+        } else if let Some(ids) = db.can_ids() {
+            DuplicateTargetKey::Can(ids)
+        } else {
+            // Without resolved DoIP addressing the addresses are com-param
+            // fallback values shared by every such ECU (e.g. a functional
+            // description), and without CAN IDs there is no other target
+            // identity - no evidence of an actual collision, so grouping
+            // would spuriously mark unrelated ECUs as duplicates and
+            // suppress base-variant fallback for all of them.
+            tracing::debug!(
+                ecu_name = %name,
+                "Skipping duplicate detection - neither resolved DoIP addressing nor CAN IDs"
+            );
+            continue;
+        };
+        ecus_by_target.entry(key).or_default().push(name.clone());
+    }
+
+    for ecu_names in ecus_by_target.values() {
+        if ecu_names.len() <= 1 {
+            continue;
+        }
+
+        for ecu_name in ecu_names {
+            let Some(db_lock) = databases.get(ecu_name) else {
+                continue;
+            };
+
+            let mut db = db_lock.write().await;
+            let duplicates: HashSet<String> = ecu_names
+                .iter()
+                .filter(|&name| name != ecu_name)
+                .cloned()
+                .collect();
+            db.set_duplicating_ecu_names(duplicates);
+        }
+    }
+}
+
+/// Extract and build the diagnostic database from proto data.
+///
+/// # Errors
+/// Returns [`MddLoadingError::LoadFailed`] if the MDD has no diagnostic
+/// description or if the payload cannot be parsed.
+fn build_diagnostic_database(
+    proto_data: &mut HashMap<ChunkType, Vec<Chunk>>,
+    ctx: &EcuLoadContext<'_>,
+) -> Result<cda_database::datatypes::DiagnosticDatabase, MddLoadingError> {
+    let payload = proto_data
+        .remove(&ChunkType::DiagnosticDescription)
+        .and_then(|mut chunks| chunks.pop())
+        .and_then(|c| c.payload)
+        .ok_or_else(|| MddLoadingError::LoadFailed {
+            path: ctx.mddfile.display().to_string(),
+            ecu: ctx.ecu_name.clone(),
+            reason: "Empty MDD - no diagnostic description payload found".to_string(),
+        })?;
+
+    let mut cfg = ctx.database_config.clone();
+    if let Some(override_value) = ctx
+        .ecu_config_map
+        .get(&ctx.ecu_name.to_lowercase())
+        .and_then(|c| c.ignore_protocol)
+    {
+        cfg.ignore_protocol = override_value;
+    }
+
+    cda_database::datatypes::DiagnosticDatabase::new_from_bytes(
+        ctx.mdd_path.clone(),
+        payload,
+        ctx.flat_buf_settings.clone(),
+        cfg,
+    )
+    .map_err(|e| MddLoadingError::LoadFailed {
+        path: ctx.mddfile.display().to_string(),
+        ecu: ctx.ecu_name.clone(),
+        reason: e.to_string(),
+    })
+}
+
+/// Create an ECU manager from diagnostic database and configuration.
+///
+/// # Errors
+/// Returns [`MddLoadingError::EcuManagerFailed`] if the manager cannot be
+/// created.
+fn create_ecu_manager<S: SecurityPlugin>(
+    diag_database: cda_database::datatypes::DiagnosticDatabase,
+    protocol: Protocol,
+    ecu_type: EcuManagerType,
+    effective_com_params: &ComParams,
+    ctx: &EcuLoadContext<'_>,
+) -> Result<EcuManager<S>, MddLoadingError> {
+    EcuManager::new(
+        diag_database,
+        protocol,
+        effective_com_params,
+        ctx.database_naming_convention.clone(),
+        EcuManagerConfig {
+            type_: ecu_type,
+            fallback_to_base_variant: ctx.fallback_to_base_variant,
+            strict_parameter_validation: ctx.strict_parameter_validation,
+        },
+        ctx.func_description_cfg,
+    )
+    .map_err(|e| MddLoadingError::EcuManagerFailed {
+        ecu: ctx.ecu_name.clone(),
+        reason: format!("{e:?}"),
+    })
+}
+
+/// Extract file chunks from proto data.
+fn extract_file_chunks(mut proto_data: HashMap<ChunkType, Vec<Chunk>>) -> Vec<Chunk> {
+    let filtered_chunks: Vec<Chunk> = [
+        ChunkType::CodeFile,
+        ChunkType::CodeFilePartial,
+        ChunkType::EmbeddedFile,
+    ]
+    .iter()
+    .filter_map(|chunk_type| proto_data.remove(chunk_type))
+    .flat_map(IntoIterator::into_iter)
+    .collect();
+
+    filtered_chunks
+        .into_iter()
+        .chain(proto_data.into_values().flat_map(IntoIterator::into_iter))
+        .collect()
+}
+
+/// Load and process a single ECU from MDD file.
+///
+/// # Errors
+/// Returns the [`MddLoadingError`] of the step that failed.
+fn load_ecu_from_file<S: SecurityPlugin>(
+    proto_data: HashMap<ChunkType, Vec<Chunk>>,
+    ctx: &EcuLoadContext<'_>,
+    per_ecu_cfg: Option<&EcuConfig>,
+) -> Result<EcuLoadResult<S>, MddLoadingError> {
+    let mut proto_data = proto_data;
+    let diag_database = build_diagnostic_database(&mut proto_data, ctx)?;
+    // resolve_com_params logs the cause itself.
+    let effective_com_params = crate::config::com_params::resolve_com_params(
+        &ctx.ecu_name,
+        ctx.com_params,
+        per_ecu_cfg.and_then(|c| c.com_params.as_ref()),
+    )
+    .ok_or_else(|| MddLoadingError::ComParamsInvalid {
+        ecu: ctx.ecu_name.clone(),
+    })?;
+    let protocol = per_ecu_cfg.and_then(|c| c.protocol.as_deref()).map_or_else(
+        || ctx.protocol.clone(),
+        |name| Protocol::new(name.to_owned()),
+    );
+    let ecu_type = if ctx.func_description_cfg.description_database == ctx.ecu_name {
+        EcuManagerType::FunctionalDescription
+    } else {
+        EcuManagerType::Ecu
+    };
+    let manager = create_ecu_manager(
+        diag_database,
+        protocol,
+        ecu_type,
+        &effective_com_params,
+        ctx,
+    )?;
+    let files = extract_file_chunks(proto_data);
+
+    Ok(EcuLoadResult { manager, files })
+}
+
+/// Loads a single MDD file and returns the ECU name, manager, and file manager.
+///
+/// # Errors
+///
+/// Returns [`MddLoadingError`] if decompression or loading fails.
+fn load_single_mdd<S: SecurityPlugin>(
+    path: &Path,
+    config: &Configuration,
+    ecu_config_map: &HashMap<String, EcuConfig>,
+    protocol: &Protocol,
+) -> Result<(String, EcuManager<S>, FileManager), MddLoadingError> {
+    let mdd_path =
+        path.to_str()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| MddLoadingError::LoadFailed {
+                path: path.display().to_string(),
+                ecu: "unknown".to_string(),
+                reason: "Failed to convert path to string".to_string(),
+            })?;
+
+    // Ensure the MDD file contains uncompressed data (rewrite on first
+    // use), so that subsequent loads skip LZMA decompression.
+    if config.flat_buf.mdd_decompress
+        && let Err(e) = update_mdd_uncompressed(&mdd_path)
+    {
+        return Err(MddLoadingError::DecompressFailed {
+            path: mdd_path,
+            reason: e.to_string(),
+        });
+    }
+
+    let (ecu_name, proto_data) = cda_database::load_proto_data(&mdd_path, PROTO_LOAD_CONFIG)
+        .map_err(|e| MddLoadingError::LoadFailed {
+            path: mdd_path.clone(),
+            ecu: "unknown".to_string(),
+            reason: e.to_string(),
+        })?;
+
+    let mddfile = PathBuf::from(path);
+    let com_params = Arc::new(config.com_params.clone());
+    let ecu_config_map = Arc::new(ecu_config_map.clone());
+
+    let ctx = EcuLoadContext {
+        mdd_path: mdd_path.clone(),
+        mddfile: &mddfile,
+        ecu_name: ecu_name.clone(),
+        flat_buf_settings: &config.flat_buf,
+        database_config: &config.database,
+        ecu_config_map: &ecu_config_map,
+        database_naming_convention: config.database.naming_convention.clone(),
+        func_description_cfg: &config.functional_description,
+        protocol,
+        com_params: &com_params,
+        fallback_to_base_variant: config.database.fallback_to_base_variant,
+        strict_parameter_validation: config.strict.parameter_validation(),
+    };
+
+    let per_ecu_cfg = ecu_config_map.get(&ecu_name.to_lowercase());
+    let result = load_ecu_from_file(proto_data, &ctx, per_ecu_cfg)?;
+
+    let file_manager = FileManager::new(mdd_path, result.files);
+    Ok((ecu_name, result.manager, file_manager))
+}
+
+/// Inserts or updates an ECU entry in the loaded map, handling duplicate names
+/// by comparing logical addresses and revisions.
+fn insert_or_update_ecu<S: SecurityPlugin>(
+    loaded_ecus: &mut LoadedEcuMap<S>,
+    ecu_name: &str,
+    ecu_manager: EcuManager<S>,
+    ecu_metadata: EcuMetadata,
+) {
+    let mdd_path = ecu_metadata.mdd_path.clone();
+    match loaded_ecus.entry(ecu_name.to_owned()) {
+        HashMapEntry::Occupied(mut entry) => {
+            let (existing_ecu, existing_meta) = entry.get_mut();
+            if !ecu_manager.logical_address_eq(existing_ecu) {
+                tracing::error!(
+                    ecu_name = %ecu_name,
+                    "Duplicate ECU with different addresses. Marking as invalid."
+                );
+                existing_meta.valid = false;
+                return;
+            }
+            if ecu_manager.revision() > existing_ecu.revision() {
+                tracing::warn!(
+                    ecu_name = %ecu_name,
+                    existing_mdd = %existing_meta.mdd_path,
+                    existing_revision = %existing_ecu.revision(),
+                    new_mdd = %mdd_path,
+                    new_revision = %ecu_manager.revision(),
+                    "Replacing ECU with newer revision"
+                );
+                entry.insert((ecu_manager, ecu_metadata));
+            } else {
+                tracing::warn!(
+                    ecu_name = %ecu_name,
+                    existing_mdd = %existing_meta.mdd_path,
+                    existing_revision = %existing_ecu.revision(),
+                    new_mdd = %mdd_path,
+                    new_revision = %ecu_manager.revision(),
+                    "Keeping existing ECU with newer or equal revision"
+                );
+            }
+        }
+        HashMapEntry::Vacant(entry) => {
+            entry.insert((ecu_manager, ecu_metadata));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cda_interfaces::storage_api::{CollectionName, Storage};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn resolve_mdd_paths_ignores_non_mdd_files() {
+        let fixture = Fixture::new_with_mdd_files(&[
+            ("valid.mdd", b"MDD_DATA"),
+            ("readme.txt", b"TEXT"),
+            ("data.bin", b"BIN"),
+        ]);
+
+        let mdd_files =
+            resolve_mdd_paths(&fixture.storage, fixture.db_dir.path().to_str().unwrap()).await;
+
+        let [valid_file] = mdd_files.as_slice() else {
+            panic!("Exactly one file expected.");
+        };
+        assert_eq!(valid_file.file_name().unwrap(), "valid.mdd");
+    }
+
+    #[tokio::test]
+    async fn resolve_mdd_paths_falls_back_when_storage_nonexistent() {
+        let fixture = Fixture::new_with_mdd_files(&[("ECU.mdd", b"DATA")]);
+
+        let paths =
+            resolve_mdd_paths(&fixture.storage, fixture.db_dir.path().to_str().unwrap()).await;
+
+        let first = paths.first().expect("first should exist");
+
+        assert_eq!(paths.len(), 1, "Expected 1 MDD path from fallback");
+        assert!(
+            first.starts_with(fixture.db_dir.path()),
+            "Path should come from database dir when storage is nonexistent: {}",
+            first.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_mdd_paths_uses_empty_storage_collection() {
+        let fixture = Fixture::new_with_mdd_files(&[("ECU.mdd", b"DATA")]);
+        let mut tx = fixture.storage.begin_transaction().unwrap();
+        fixture
+            .storage
+            .create_collection(&mut tx, &CollectionName::DiagnosticDatabase)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let paths =
+            resolve_mdd_paths(&fixture.storage, fixture.db_dir.path().to_str().unwrap()).await;
+
+        assert!(
+            paths.is_empty(),
+            "An empty database collection is a deliberate empty data set, not a reason to load \
+             the database dir: {paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_mdd_paths_loads_nothing_from_a_missing_dir() {
+        let fixture = Fixture::new_with_mdd_files(&[]);
+        let missing = fixture.db_dir.path().join("missing");
+
+        let paths = resolve_mdd_paths(&fixture.storage, missing.to_str().unwrap()).await;
+
+        assert!(paths.is_empty(), "{paths:?}");
+    }
+
+    #[tokio::test]
+    async fn resolve_mdd_paths_sorts_storage_paths_largest_first() {
+        let fixture = Fixture::new_with_mdd_files(&[]);
+        let collection = fixture
+            .storage
+            .get_or_create_collection(&CollectionName::DiagnosticDatabase)
+            .await
+            .unwrap();
+        for (key, data) in [("small.mdd", &b"S"[..]), ("large.mdd", &b"LARGE"[..])] {
+            let mut tx = fixture.storage.begin_transaction().unwrap();
+            let mut data = data;
+            collection.write(&mut tx, key, &mut data).await.unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        let paths =
+            resolve_mdd_paths(&fixture.storage, fixture.db_dir.path().to_str().unwrap()).await;
+
+        let names: Vec<_> = paths.iter().map(|p| p.file_name().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec!["large.mdd", "small.mdd"],
+            "storage and database.dir must load in the same order"
+        );
+    }
+
+    #[test]
+    fn build_diagnostic_database_reports_empty_mdd() {
+        let mddfile = PathBuf::from("ECU.mdd");
+        let flat_buf = FlatbBufConfig::default();
+        let database_config = cda_database::DatabaseConfig::default();
+        let ecu_config_map = Arc::new(HashMap::new());
+        let func_description_cfg = FunctionalDescriptionConfig::default();
+        let protocol = Protocol::new("UDS_Ethernet_DoIP".to_owned());
+        let com_params = Arc::new(ComParams::default());
+        let ctx = EcuLoadContext {
+            mdd_path: mddfile.display().to_string(),
+            mddfile: &mddfile,
+            ecu_name: "ECU".to_owned(),
+            flat_buf_settings: &flat_buf,
+            database_config: &database_config,
+            ecu_config_map: &ecu_config_map,
+            database_naming_convention: DatabaseNamingConvention::default(),
+            func_description_cfg: &func_description_cfg,
+            protocol: &protocol,
+            com_params: &com_params,
+            fallback_to_base_variant: false,
+            strict_parameter_validation: false,
+        };
+
+        let result = build_diagnostic_database(&mut HashMap::new(), &ctx);
+
+        match result {
+            Err(MddLoadingError::LoadFailed { path, ecu, reason }) => {
+                assert_eq!(path, "ECU.mdd");
+                assert_eq!(ecu, "ECU");
+                assert!(reason.contains("Empty MDD"));
+            }
+            Err(other) => panic!("Expected LoadFailed, got {other}"),
+            Ok(_) => panic!("Expected LoadFailed, got a database"),
+        }
+    }
+
+    struct Fixture {
+        storage: LocalStorage,
+        db_dir: TempDir,
+        _storage_dir: TempDir, // carried along so it only gets dropped/deleted at the end of the test case
+    }
+    impl Fixture {
+        fn new_with_mdd_files(mdd_files: &[(&str, &[u8])]) -> Self {
+            let storage_dir = tempfile::tempdir().expect("storage dir");
+            let db_dir = tempfile::tempdir().expect("DB dir");
+
+            let mdd_files = mdd_files
+                .iter()
+                .map(|(name, data)| (db_dir.path().join(name), *data))
+                .collect::<Vec<_>>();
+
+            for (path, data) in &mdd_files {
+                std::fs::write(path, data).expect("write MDD file");
+            }
+
+            let storage = LocalStorage::new(storage_dir.path()).expect("LocalStorage");
+
+            Self {
+                _storage_dir: storage_dir,
+                storage,
+                db_dir,
+            }
+        }
+    }
+}

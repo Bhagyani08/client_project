@@ -1,0 +1,68 @@
+# SPDX-FileCopyrightText: 2025 Copyright (c) Contributors to the Eclipse Foundation
+#
+# See the NOTICE file(s) distributed with this work for additional
+# information regarding copyright ownership.
+#
+# This program and the accompanying materials are made available under the
+# terms of the Apache License Version 2.0 which is available at
+# https://www.apache.org/licenses/LICENSE-2.0
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "cda-comm-doip"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+description = "DoIP communication layer used in CDA"
+homepage.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# internal dependencies
+cda-interfaces = { workspace = true }
+# external
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+# DoIP
+doip-definitions = { workspace = true }
+doip-codec = { workspace = true }
+# tls
+openssl = { workspace = true, optional = true }
+tokio-openssl = { workspace = true, optional = true }
+
+schemars = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+socket2 = { workspace = true, features = ["all"] }
+#tokio
+tokio = { workspace = true, features = ["time", "fs", "sync", "rt", "macros"] }
+tokio-util = { workspace = true, features = ["codec", "net"] }
+# futures
+futures = { workspace = true }
+# logging & tracing
+tracing = { workspace = true }
+
+mbedtls-rs = { workspace = true, optional = true }
+
+[features]
+default = []
+# EXPERIMENTAL
+# This feature enable experimental support for mbedtls TLS.
+# The mbedtls crate used is NOT security reviewed - use at your own discretion.
+# mbedtls cannot be combined with openssl feature
+mbedtls = ["dep:mbedtls-rs"]
+# enable openssl TLS - if enabled together with mbedtls openssl will be prefered!
+# This allows to still use `--all-features` when running clippy for example.
+openssl = ["dep:openssl", "dep:tokio-openssl"]
+openssl-vendored = ["openssl", "openssl/vendored"]
+dlt-tracing = ["cda-interfaces/dlt-tracing"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time", "sync", "test-util"] }
+serde_json = { workspace = true }

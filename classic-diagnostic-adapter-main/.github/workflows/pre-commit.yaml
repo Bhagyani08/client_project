@@ -1,0 +1,90 @@
+# SPDX-FileCopyrightText: 2025 Copyright (c) Contributors to the Eclipse Foundation
+#
+# See the NOTICE file(s) distributed with this work for additional
+# information regarding copyright ownership.
+#
+# This program and the accompanying materials are made available under the
+# terms of the Apache License Version 2.0 which is available at
+# https://www.apache.org/licenses/LICENSE-2.0
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: pre-commit
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  versions:
+    uses: ./.github/workflows/tool-versions.yml
+
+  pre-commit:
+    needs: versions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+      - name: Setup DLT tracing lib
+        uses: eclipse-opensovd/dlt-tracing-lib/.github/actions/setup-dlt@main
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: ${{ needs.versions.outputs.protoc }}
+          # The action queries the GitHub API to fetch releases data,
+          # to avoid rate limiting, passing the default token.
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install nightly Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ needs.versions.outputs.nightly }}
+          components: clippy,rustfmt
+      - name: Install Go (required for gitleaks)
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Cache prek hooks
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/prek
+          key: prek-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: |
+            prek-${{ runner.os }}-
+      # All hooks, including the manual-stage clippy with all features.
+      - name: Run checks
+        run: make precommit-all-features
+      - name: Validate commit subjects (Conventional Commits)
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          fail=0
+          for sha in $(gh api "/repos/${{ github.repository }}/pulls/${{ github.event.number }}/commits" --jq '.[].sha'); do
+            git log -1 --format=%B "$sha" > /tmp/commit-msg 2>/dev/null || {
+              git fetch --no-tags --depth=1 origin "$sha"
+              git log -1 --format=%B "$sha" > /tmp/commit-msg
+            }
+            if ! uv run --locked prek run --hook-stage commit-msg \
+              --commit-msg-filename /tmp/commit-msg conventional-pre-commit; then
+              echo "::error::Non-conventional commit subject: $(git log -1 --format='%h %s' "$sha")"
+              fail=1
+            fi
+          done
+          exit "$fail"

@@ -1,0 +1,1366 @@
+.. SPDX-FileCopyrightText: 2025 Copyright (c) Contributors to the Eclipse Foundation
+..
+.. See the NOTICE file(s) distributed with this work for additional
+.. information regarding copyright ownership.
+..
+.. This program and the accompanying materials are made available under the
+.. terms of the Apache License Version 2.0 which is available at
+.. https://www.apache.org/licenses/LICENSE-2.0
+..
+.. SPDX-License-Identifier: Apache-2.0
+
+SOVD-API
+--------
+
+Data Types
+^^^^^^^^^^
+
+.. arch:: ODX to JSON data type mapping
+    :id: arch~sovd-api-data-types-mapping-iso17978
+    :status: draft
+
+    Data types must be mapped as follows:
+
+    .. list-table:: ODX to JSON data type mapping
+       :header-rows: 1
+
+       * - ODX data type
+         - JSON data type (format)
+         - Comment
+       * - A_ASCIISTRING
+         - string
+         -
+       * - A_BOOLEAN
+         - boolean
+         -
+       * - A_BYTEFIELD
+         - string (byte | hex)
+         - see :ref:`requirements_sovd_api_bytefield_as_hex`
+       * - A_FLOAT32
+         - number (float)
+         -
+       * - A_FLOAT64
+         - number (double)
+         -
+       * - A_INT32
+         - integer (int32)
+         -
+       * - A_UINT32
+         - integer (int64)
+         -
+       * - A_UNICODE2STRING
+         - string
+         -
+       * - A_UTF8STRING
+         - string
+         -
+
+    **Primitive JSON types**
+
+    All primitive JSON types (string, array, number, integer, boolean, and object) can be used.
+
+    For strings, the following format identifiers can be used:
+
+    .. list-table:: JSON string formats
+       :header-rows: 1
+
+       * - JSON type
+         - JSON format
+         - Comment
+       * - string
+         - byte
+         - Base64-encoded binary data
+       * - string
+         - hex
+         - Hexadecimal-encoded binary data (e.g. f0cacc1a). Can be prefixed with 0x and contain spaces.
+       * - string
+         - uuid
+         - UUID identifier according to RFC 4122 (https://www.rfc-editor.org/rfc/rfc4122)
+       * - string
+         - uri
+         - Absolute URI according to RFC 3986 (https://www.rfc-editor.org/rfc/rfc3986)
+       * - string
+         - uri-reference
+         - Relative URI according to RFC 3986 (https://www.rfc-editor.org/rfc/rfc3986)
+       * - string
+         - json-pointer
+         - Pointer to a specific value within the JSON according to RFC 6901 (https://www.rfc-editor.org/rfc/rfc6901)
+
+    .. note:: TODO More string formats required?
+
+    **Mapping of complex data types**
+
+    .. note:: TODO Mapping of complex data types
+
+.. _architecture_bulk_data:
+
+Bulk Data
+^^^^^^^^^
+
+.. arch:: Bulk-Data Endpoints
+    :id: arch~sovd-api-bulk-data
+    :status: draft
+
+    Bulk-data endpoints allow the management of bulk data, like files that are to be used for flashing.
+
+    Paths are required to be in the following structure: ``/bulk-data/{category}/{id}``. For extensions, the name ``bulk-data`` may only be used at the end of a path element.
+
+    .. list-table:: Bulk Data endpoints
+       :header-rows: 1
+
+       * - Method
+         - Path
+         - Description
+       * - GET
+         - ``/bulk-data/{category}``
+         - Retrieves a list of entries in that category and their IDs
+       * - GET
+         - ``/bulk-data/{category}/{entry-id}``
+         - Downloads the data for the entry. The MIME type is determined by the server and the content of the data.
+       * - POST
+         - ``/bulk-data/{category}``
+         - Uploads data to the category. Additional metadata (e.g. filename) can be provided through Content-Disposition: form-data
+       * - DELETE
+         - ``/bulk-data/{category}``
+         - Requests the deletion of all data for that category
+       * - DELETE
+         - ``/bulk-data/{category}/{entry-id}``
+         - Requests the deletion of a specific entry
+
+    .. note::
+       IMPORTANT: All calls to the aforementioned endpoints can fail with reasonable HTTP status codes (e.g. 401, 403, 409, 501), depending on the context and state.
+
+    .. uml:: images/bulk_data.puml
+
+Entities
+^^^^^^^^
+
+.. arch:: Components Entity Collection
+    :id: arch~sovd-api-components-entity-collection
+    :status: draft
+
+    The ``/components`` endpoint serves as the entry point for discovering available ECU entities.
+
+    **GET /components**
+
+    Returns a list of all ECU entities that have been loaded from diagnostic descriptions (MDD files). Each item in
+    the list contains the ECU name, a lowercase identifier, and a URI reference to the individual component resource.
+
+    The response may include additional fields beyond the standard ``items`` list. These additional fields group
+    ECUs based on configurable conditions evaluated against the diagnostic description metadata. The names and
+    filter criteria for these additional fields are defined in the application configuration.
+
+    **GET /components/{ecu-name}**
+
+    Returns detailed information about a specific ECU entity, including:
+
+    - The ECU identifier and name
+    - Variant information (name, base variant flag, connectivity state, and logical address)
+    - A ``last_seen`` timestamp of the last successful diagnostic contact with the ECU (see
+      :need:`arch~dt-ecu-states`), if the ECU has ever been contacted (either in the current session, or,
+      when loaded from a persisted ECU list, in a previous session)
+    - URI references to the standardized resource collection endpoints: data, operations, configurations, faults, modes, locks, and extension endpoints
+
+    The connectivity state of an ECU reflects its current diagnostic reachability and variant detection status:
+
+    .. list-table:: ECU connectivity states
+       :header-rows: 1
+
+       * - State
+         - Description
+       * - Online
+         - The ECU is reachable and has a detected variant. This also covers the internal AssumedOnline
+           state (see :need:`arch~dt-ecu-states`), i.e. an ECU known to have been Online in a previous
+           session (from a persisted ECU list) but not yet contacted in the current session; the
+           ``last_seen`` timestamp allows clients to tell these two cases apart.
+       * - Offline
+         - The ECU has not been contacted since startup
+       * - NotTested
+         - Variant detection has not yet been performed
+       * - Duplicate
+         - Multiple variants match the ECU response, superseded by a more specific match
+       * - Disconnected
+         - The ECU was previously reachable but is no longer responding
+       * - NoVariantDetected
+         - The ECU responded but no matching variant was found
+
+    Optionally, diagnostic description metadata (SDGs) for the ECU can be included in the response through a query parameter.
+
+.. arch:: Standardized Resource Collection Mapping
+    :id: arch~sovd-api-standardized-resource-collection-mapping
+    :status: draft
+
+    Every ECU with a ``mdd`` file is an entity within the ``/components`` entity collection.
+
+    This doesn't include the ``mdd`` files used for functional communication (see :ref:`architecture_functional_communication`).
+
+ECU resource collection
+^^^^^^^^^^^^^^^^^^^^^^^
+
+.. arch:: ECU Resource Collection
+    :id: arch~sovd-api-ecu-resource-collection
+    :status: draft
+
+    Each ECU entity must provide a standardized resource collection as defined in ISO 17978-3, chapter 5.4.2.
+
+    The resource collection for ECUs is defined in an OpenAPI Specification: :download:`ECU Resource Collection Specification <openapi/ecu_resource_collection.yaml>`
+
+
+SDG/SD Metadata
+^^^^^^^^^^^^^^^
+
+.. arch:: Component SDG/SDs
+    :id: arch~sovd-api-component-sdgsd
+    :links: dimpl~sovd-api-component-sdgsd, dimpl~sovd-api-component-data-sdgsd, dimpl~sovd-api-component-operations-sdgsd, itest~sovd-api-component-sdgsd, itest~sovd-api-component-alias-sdgsd, itest~sovd-api-component-data-sdgsd, itest~sovd-api-component-operations-sdgsd
+    :status: draft
+
+    Special Data Groups (SDGs) and Special Data (SDs) from the diagnostic description can be retrieved through an
+    opt-in query parameter ``x-sovd2uds-includesdgs`` (with alias ``x-include-sdgs``). When set to ``true``, the
+    response includes the SDG/SD metadata instead of or in addition to the normal response data.
+
+    **ECU-level SDGs**
+
+    On the ``GET /components/{ecu-name}`` endpoint, including SDGs adds an ``sdgs`` property to the ECU response
+    object. The SDGs returned are those associated with the ECU entity in the diagnostic description (retrieved
+    without a specific service context).
+
+    **Service-level SDGs**
+
+    On the ``GET /components/{ecu-name}/data/{data-identifier}`` endpoint, when SDGs are requested, the endpoint
+    returns the SDGs associated with the diagnostic service instead of the normal data response. The response
+    contains an ``items`` map keyed by a combination of the service name and its action type, where each entry
+    holds the list of SDGs for that service action.
+
+    **Operation-level SDGs**
+
+    On the ``GET /components/{ecu-name}/operations/{operation-identifier}`` endpoint, when SDGs are requested, the endpoint
+    returns the SDGs associated with the diagnostic service instead of the normal data response. The response
+    contains an ``items`` map keyed by a combination of the service name and its action type, where each entry
+    holds the list of SDGs for that service action.
+
+    For asynchronous operations (which consist of multiple subfunctions such as Start, Stop, RequestResults),
+    each subfunction's SDGs are returned as separate entries in the ``items`` map, keyed by
+    ``{service_name}_{action_type}`` (lowercased). This naturally separates potentially conflicting SDGs
+    from different subfunctions without requiring wrapper entries.
+
+    **Data format**
+
+    The SDG/SD structure is recursive. Each entry in the list is one of two types:
+
+    .. list-table:: SD entry fields
+       :header-rows: 1
+
+       * - Field
+         - Type
+         - Description
+       * - ``value``
+         - string (optional)
+         - The value of the SD
+       * - ``si``
+         - string (optional)
+         - Semantic information -- a descriptor or key for the entry
+       * - ``ti``
+         - string (optional)
+         - Text information -- the textual content of the entry
+
+    .. list-table:: SDG entry fields
+       :header-rows: 1
+
+       * - Field
+         - Type
+         - Description
+       * - ``caption``
+         - string (optional)
+         - The name of the group
+       * - ``si``
+         - string (optional)
+         - Semantic information -- a descriptor or key for the group
+       * - ``sdgs``
+         - list (optional)
+         - A nested list of SD and SDG entries, allowing arbitrary nesting depth
+
+    SD and SDG entries are distinguished by their structure -- an entry with a ``sdgs`` or ``caption`` field is
+    an SDG, while an entry with ``value`` or ``ti`` fields is an SD.
+
+
+Data Resources -- SID 22\ :sub:`16` & 2E\ :sub:`16`
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+
+.. arch:: Data Resources
+    :id: arch~sovd-api-data-resources
+    :status: draft
+
+    Data resources for ECUs are available in the standardized resource collection within the path ``/components/{ecu-name}/data``.
+
+    The data main path returns a list of the data identifiers available as ``/data/{data-identifier}``, as well as metadata.
+
+    A data identifier in the list is described with the following attributes (all strings):
+
+    .. list-table:: Data identifier attributes
+       :header-rows: 1
+
+       * - Attribute
+         - Description
+       * - id
+         - Path element ID (i.e. short name)
+       * - name
+         - Name of the element (i.e. long name)
+       * - category
+         - Category of the element
+
+    **Naming**
+
+    Names for data resources are determined by taking all diag-services defined for 22\ :sub:`16` and 2E\ :sub:`16` -- their short name is taken as a base and processed by removing configurable prefixes/suffixes, to determine the data identifier within the ``/data/{data-identifier}`` path.
+
+    The following diagrams illustrate the message flow for reading and writing data resources:
+
+    .. uml:: images/data_read.puml
+
+    .. uml:: images/data_write.puml
+
+Categories
+^^^^^^^^^^
+
+.. arch:: Data Identifier Categories
+    :id: arch~sovd-api-data-identifier-categories
+    :status: draft
+
+    The following standard categories are defined by the standard:
+
+    .. list-table:: Standard categories
+       :header-rows: 1
+
+       * - Name
+         - Description
+       * - identData
+         - Identifications -- read access to fixed parameters that identify an ECU/vehicle, e.g. part number or VIN.
+           Write access may be possible for ECU manufacturing / vehicle production purposes, but is typically not
+           possible after final vehicle production.
+       * - currentData
+         - Measurements -- read access to dynamically changing values, e.g. battery voltage.
+       * - storedData
+         - Parameters -- read and write access to parameters in the ECU/vehicle.
+       * - sysInfo
+         - System information -- read access to dynamically changing system resources, e.g. memory/CPU load.
+
+    Additional custom categories must be prefixed with ``x-sovd2uds-``, or, in custom vendor configuration, with a
+    vendor-specific prefix different from ``x-sovd2uds-``. The prefix ``x-sovd-`` is reserved by the standard and
+    must never be used for custom categories.
+
+    .. note::
+       The SOVD standard also defines the resources ``GET /{entity-path}/data-categories`` (see
+       :need:`arch~sovd-api-data-categories-endpoint`), ``GET /{entity-path}/data-groups`` (see
+       :need:`arch~sovd-api-data-groups-endpoint`), and ``categories``/``groups`` query parameters on
+       ``GET /{entity-path}/data`` (see :need:`arch~sovd-api-data-query-filtering`). ``data-categories`` and the
+       ``categories`` query parameter are implemented; ``data-groups`` and the ``groups`` query parameter are
+       **not yet implemented** by the CDA (their configuration mechanism is left open for a future architecture
+       change, see :need:`arch~sovd-api-data-groups-endpoint`).
+
+.. arch:: Data Categories Endpoint
+    :id: arch~sovd-api-data-categories-endpoint
+    :status: draft
+
+    ``GET /components/{ecu-name}/data-categories`` returns the categories actually in use by the ECU's ``/data``
+    resource collection, i.e. the distinct set of values returned as ``category`` on the ``/data`` items -- not
+    necessarily every standard category defined by :need:`arch~sovd-api-data-identifier-categories`.
+
+    .. list-table:: Data categories response
+       :header-rows: 1
+
+       * - Attribute
+         - Description
+       * - items
+         - Array of ``DataCategoryInformation`` (see below).
+
+    .. list-table:: DataCategoryInformation
+       :header-rows: 1
+
+       * - Attribute
+         - Description
+       * - item
+         - The category name.
+       * - category_translation_id
+         - Optional identifier for translating the category name (CDA does not currently support translation and
+           may omit this attribute).
+
+    Example::
+
+       GET /components/WindowControl/data-categories
+
+       {
+           "items": [
+               { "item": "currentData" },
+               { "item": "identData" }
+           ]
+       }
+
+.. arch:: Data Groups Endpoint
+    :id: arch~sovd-api-data-groups-endpoint
+    :status: draft
+
+    .. note::
+       Not yet implemented.
+
+    ``GET /components/{ecu-name}/data-groups`` returns the groups defined for the ECU's ``/data`` resources. Groups
+    are an optional, orthogonal grouping mechanism to categories -- a data resource may belong to zero or more
+    groups, in addition to having exactly one category. Groups are not intended to be used to partition data
+    across subcomponents; subcomponent data must instead be exposed via the corresponding subcomponent's own
+    ``/data`` resource collection.
+
+    **Query Parameters**
+
+    .. list-table:: Data groups query parameters
+       :header-rows: 1
+
+       * - Parameter Name
+         - Description
+       * - category
+         - Optional. Filters the returned groups to those associated with the given category. If omitted, all
+           groups of the entity are returned.
+
+    **Response**
+
+    .. list-table:: ValueGroup
+       :header-rows: 1
+
+       * - Attribute
+         - Description
+       * - id
+         - Unique identifier for the group, unique across all categories.
+       * - category
+         - The category the group is associated with.
+       * - category_translation_id
+         - Optional identifier for translating the category name.
+       * - group
+         - Optional display name of the group.
+       * - group_translation_id
+         - Optional identifier for translating the group name.
+
+    Example::
+
+       GET /components/WindowControl/data-groups?category=currentData
+
+       {
+           "items": [
+               { "id": "front", "category": "currentData" },
+               { "id": "rear", "category": "currentData" }
+           ]
+       }
+
+    Group membership for a given data resource must itself be configurable per functional-class / per-service,
+    analogous to the category mapping in :need:`arch~sovd-api-functional-class-mapping`; the exact configuration
+    mechanism for assigning groups is left open for a future architecture change once this endpoint is
+    implemented.
+
+.. arch:: Data Query Filtering
+    :id: arch~sovd-api-data-query-filtering
+    :status: draft
+
+    .. note::
+       The ``categories`` query parameter is implemented. The ``groups`` query parameter is **not yet
+       implemented**, since it depends on the group-assignment configuration mechanism described in
+       :need:`arch~sovd-api-data-groups-endpoint`, which is also not yet implemented.
+
+    ``GET /components/{ecu-name}/data`` must support the following additional query parameters:
+
+    .. list-table:: Data query parameters
+       :header-rows: 1
+
+       * - Parameter Name
+         - Description
+       * - categories
+         - Optional. Array of categories. Filters the returned data resources to those whose
+           ``category`` is one of the given values.
+       * - groups
+         - Optional. Array of groups. Filters the returned data resources to those belonging to at
+           least one of the given groups. If both ``groups`` and ``categories`` are provided, ``groups`` takes
+           precedence and ``categories`` must be ignored by the CDA, since ``groups`` is the more restrictive
+           filter.
+
+    Array query parameters are serialized in OpenAPI ``form`` style with ``explode=true`` (ISO 17978-3 §6.2.7),
+    i.e. multiple values are passed by repeating the parameter. Comma-separated values are not supported.
+
+    Example::
+
+       GET /components/FLXC1000/data?categories=identData&categories=currentData
+
+.. arch:: Functional Class to Category and Configuration Mapping
+    :id: arch~sovd-api-functional-class-mapping
+    :status: draft
+
+    Whether a diag-service defined for 22\ :sub:`16` / 2E\ :sub:`16` is exposed as a ``/data`` resource (with a
+    category) or as a ``/configurations`` resource is determined by configuration, based on the ODX functional
+    class the service belongs to. The mapping has two parts:
+
+    1. **Configuration routing list** -- a configurable list of functional class names. Any 22\ :sub:`16`/2E\
+       :sub:`16` service belonging to one of these functional classes is exposed under ``/configurations`` instead
+       of ``/data`` (see :need:`arch~sovd-api-configuration-resources`). This generalizes the previous single
+       ``functional_class_varcoding`` name to a list, allowing multiple functional classes (e.g. varcoding,
+       calibration, ...) to be routed to ``/configurations``.
+    2. **Category mapping table** -- for services *not* routed to ``/configurations``, a configurable table maps
+       functional class names to a standard or custom category (see :need:`arch~sovd-api-data-identifier-categories`).
+       A functional class may only appear in the configuration routing list, or in the category mapping table, but
+       not both. Functional class names are compared case-insensitively, and each functional class may appear at
+       most once in the category mapping table; duplicate entries are rejected at configuration load time.
+
+    **Non-standard categories**: ISO 17978-3 only permits the standard categories and ``x-``-prefixed custom
+    categories. To allow OEM-specific setups, the CDA accepts other category names in the category mapping table
+    and as default category, but logs a warning at configuration load time for every such category.
+
+    **Precedence**: for each 22\ :sub:`16`/2E\ :sub:`16` service, the functional class is first checked against
+    the configuration routing list. If it matches, the service is exposed under ``/configurations``. Otherwise,
+    the category mapping table is consulted to determine the ``category`` attribute of the ``/data`` resource.
+
+    **Fallback / default category**: if a service's functional class (or a service without any functional class)
+    has no matching entry in the category mapping table, a configurable default category is used instead of
+    rejecting or silently mis-categorizing the service. This default must itself be a valid standard or
+    ``x-sovd2uds-``-prefixed custom category (e.g. ``x-sovd2uds-unmapped``), so that unmapped services remain
+    clearly identifiable to integrators and testers rather than being bucketed into a standard category by
+    accident.
+
+    **Configuration shape** (see ``[database.naming_convention]`` in the sample configuration file):
+
+    .. code-block:: toml
+
+       [database.naming_convention]
+       # Functional classes routed to /configurations instead of /data.
+       configuration_functional_classes = ["varcoding"]
+       # Default category for /data services whose functional class (or lack thereof)
+       # has no entry in `category_mapping`.
+       default_category = "x-sovd2uds-unmapped"
+
+       # Functional class -> category mapping for /data services.
+       [[database.naming_convention.category_mapping]]
+       functional_class = "identification"
+       category = "identData"
+
+       [[database.naming_convention.category_mapping]]
+       functional_class = "measurements"
+       category = "currentData"
+
+    .. note::
+       ``/configurations`` resources do not have a ``category`` attribute in the standard (see
+       :need:`arch~sovd-api-configuration-resources`); the functional class is only used there to decide
+       *which* services are routed to ``/configurations``, not to categorize them further.
+
+
+Configurations -- SID 22\ :sub:`16` & 2E\ :sub:`16`
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. arch:: Configuration Resources
+    :id: arch~sovd-api-configuration-resources
+    :status: draft
+
+    Names for data resources are determined by taking all diag-services defined for 22\ :sub:`16` and 2E\ :sub:`16`, and filtering
+    them for one of the configurable functional class names in ``configuration_functional_classes`` (see
+    :need:`arch~sovd-api-functional-class-mapping`). Their short name is taken as a base and processed by removing
+    configurable prefixes/suffixes, to determine the data identifier within the ``/configurations/{data-identifier}`` path.
+
+    The returned item properties for the ``/configurations`` item list are:
+
+    .. list-table:: Configuration item properties
+       :header-rows: 1
+
+       * - Attribute
+         - Description
+       * - id
+         - Path element ID (i.e. short name)
+       * - name
+         - Name of the element (i.e. long name)
+       * - type
+         - Always ``parameter``
+       * - x-sovd2uds-serviceAbstract
+         - Array of strings containing the SIDs and data identifier as a hexadecimal string (e.g. ["2E1234", "221234"])
+
+    The following diagrams illustrate the message flow for reading and writing configuration resources:
+
+    .. uml:: images/configuration_read.puml
+
+    .. uml:: images/configuration_write.puml
+
+    .. note::
+       ``x-sovd2uds-serviceAbstract`` is an extension to the standard.
+
+    **Rationale for serviceAbstract**
+
+    Coding data files might not include the matching name for a service, or detailed JSON parameters that would
+    be required to code an ECU. Therefore, a "reverse lookup" to the name can be required, so a client without
+    access to the diagnostic description is able to code an ECU just with the ``2E 1234 <payload>`` data,
+    utilizing the ``application/octet-stream`` extension for a ``PUT /configurations/{data-identifier}`` call.
+
+
+Operations
+----------
+
+.. arch:: Synchronous and Asynchronous Operations
+    :id: arch~sovd-api-operations-handling
+    :status: draft
+
+    Operations in the CDA are Routines (31\ :sub:`16`), Reset (11\ :sub:`16`), and an extension to configure
+    communication parameters (:ref:`architecture-sovd-api-comparams`).
+
+    **Reset -- SID 11**\ :sub:`16`
+
+    For compatibility with SOVD version 1.0 and earlier, the operations ``/operations/ecureset`` and
+    ``/operations/reset`` to reset an ECU must be supported.
+
+    **Routines -- SID 31**\ :sub:`16`
+
+    All services with the SID 31\ :sub:`16` are considered for operations -- as with data, their short names are
+    preprocessed by removing configurable prefixes/suffixes to determine routine identifiers available as
+    the ``/operations/{routine-identifier}`` path.
+
+    The items in the list of items available under ``/operations`` must include the following attributes:
+
+    .. list-table:: Operation list item attributes
+       :header-rows: 1
+
+       * - Attribute
+         - Type
+         - Description
+       * - id
+         - string
+         - Path element for the routine identifier (i.e. short name)
+       * - name
+         - string
+         - Name of the routine (long name)
+       * - proximity_proof_required
+         - boolean
+         - Always ``false``
+       * - asynchronous_execution
+         - boolean
+         - Either ``true`` or ``false``, depending on the defined subfunctions for the routine
+
+    **Synchronous -- Start only**
+
+    When a routine only defines the ``Start`` (0x01) subfunction, it is considered synchronous. This means
+    that the return for ``asynchronous_execution`` in the list will be ``false``, and that a call to
+    execute the routine with ``POST /operations/{routine-name}/executions`` is executed synchronously
+    and will directly return the response from the ECU with HTTP status ``200 OK``.
+
+    .. uml:: images/operation_sync.puml
+
+    .. note::
+       Operations without a ``Start`` subfunction can exist in the operations list but will fail
+       execution with an error unless the ``x-sovd2uds-suppressService`` query parameter is set to ``true``.
+
+    **Asynchronous -- Stop and/or RequestResults**
+
+    When a routine has ``Stop`` (0x02) and/or ``RequestResults`` (0x03) subfunctions defined, it is
+    considered asynchronous. This means that the return for ``asynchronous_execution`` in the list will
+    be ``true``, and that a call to execute the routine with ``POST /operations/{routine-name}/executions``
+    is executed on the ECU and will return the response from the ECU, as well as an ``id`` and the other
+    asynchronous properties required by the standard for calling the RequestResults subfunction with
+    ``GET /operations/{routine-name}/executions/{id}``.
+
+    The POST request returns HTTP status ``202 ACCEPTED`` with an execution identifier, status, and
+    the decoded ``Start`` response in ``parameters``. If response fields cannot be decoded, the
+    response also contains ``DataError`` entries in ``errors``. A complete conversion failure returns
+    empty ``parameters`` with an error path of ``/parameters``. Because the ECU returned a positive
+    ``Start`` response, these conversion errors do not prevent creation of the execution identifier.
+
+    An NRC, communication error, or other failure before a positive ``Start`` response is received
+    returns an error response and does not create an execution identifier.
+
+    Additionally, by calling ``DELETE /operations/{routine-name}/executions/{id}``, it's possible to
+    call the Stop subfunction of the routine.
+
+    **Subfunction Requirements**
+
+    If any of the required subfunctions are not available in the diagnostic database, the call will
+    result in an error:
+
+    - ``POST`` requires the ``Start`` (0x01) subfunction to be defined
+    - ``GET`` requires the ``RequestResults`` (0x03) subfunction to be defined
+    - ``DELETE`` requires the ``Stop`` (0x02) subfunction to be defined
+
+    These requirements can be bypassed using the ``x-sovd2uds-suppressService`` query parameter.
+    Since an entry in the list is still required, as well as the operation being asynchronous,
+    the definition of either ``RequestResults`` or ``Stop`` is a prerequisite.
+
+    **Force Parameter**
+
+    If DELETE is called and an ECU error is encountered, the ``id`` will not be deleted unless the
+    query parameter ``x-sovd2uds-force`` is set to true. This allows the client to handle
+    returned errors and to call the Stop subfunction again.
+
+    When ``x-sovd2uds-force=true``, the execution is removed from tracking even if the Stop
+    request fails or returns a negative response.
+
+    .. uml:: images/operation_async.puml
+
+    **Stop Response Data**
+
+    When a Stop subfunction returns non-empty response data, the DELETE endpoint returns HTTP status
+    ``200 OK`` with the response data in the body, instead of the standard ``204 NO CONTENT``.
+    This allows clients to access any data returned by the Stop operation.
+
+    .. note::
+       This is an extension to the standard to support Stop operations that return response data.
+
+    **Rationale for POST Response Data**
+
+    When executing an asynchronous function, there's no good way to return the response of the
+    routine with the GET to the id-endpoint, since that endpoint should only return the status of
+    the RequestResults call. Therefore, the response of the routine is returned directly when
+    executing the routine with POST in addition to the id. Partial or failed conversion of a
+    positive response is reported in the same POST body so clients can distinguish missing output
+    from an operation that returned no output.
+
+    .. note::
+       This is a deviation from the standard, but is required to allow clients to handle
+       routine responses properly.
+
+
+IOControl -- SID 2A\ :sub:`16`
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. note::
+   Not supported at this time
+
+Modes
+-----
+
+Session -- SID 10\ :sub:`16`
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. arch:: Session Endpoints
+    :id: arch~sovd-api-session-management
+    :status: draft
+
+    The endpoint ``/modes/session`` can be used to determine the current ECU session,
+    as well as trying to switch into a different session.
+
+    .. list-table:: Session endpoints
+       :header-rows: 1
+
+       * - Method
+         - Path
+         - Description
+       * - GET
+         - ``/modes/session``
+         - Returns the current session
+       * - PUT
+         - ``/modes/session``
+         - Tries to switch into the specified session
+
+    The format for the request body is::
+
+       {
+         "value": "<session name>",
+         "mode_expiration": 3600
+       }
+
+    The names of the sessions for the field ``value`` are determined by the short name for the state in the
+    ECU's state chart for the SID 10\ :sub:`16` services. It is case-insensitive.
+
+    The field ``mode_expiration`` is optional. If set, it determines the time in seconds that the session
+    should be active. Once that time expires, the session is automatically reset to the default session.
+
+    In the response body, ``id`` and ``value`` must be included.
+
+    See also chapter 7.16 in ISO 17978-3.
+
+    .. uml:: images/session_switch.puml
+
+
+Security -- SID 27\ :sub:`16`
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. arch:: Security Access Endpoints
+    :id: arch~sovd-api-security-access-modes
+    :status: draft
+
+    The endpoints are available under the path ``/modes/security``.
+
+    Works similarly to Session defined in the previous chapter. The names of the security access levels are
+    determined through the state charts for the SID 27\ :sub:`16` services.
+
+    **RequestSeed flow**
+
+    A client initiates security access by sending a ``PUT /modes/security`` request with a ``value``
+    field that encodes both the target level and whether this is a RequestSeed or SendKey request.
+    The CDA inspects the value to determine:
+
+    * ``level`` -- the state-chart level name, obtained by stripping the trailing ``_RequestSeed``
+      suffix when present (e.g. ``Level_7_RequestSeed`` -> ``Level_7``, ``Supplier_RequestSeed`` ->
+      ``Supplier``)
+    * whether the request is a **RequestSeed** (value ends with ``_RequestSeed``) or a
+      **SendKey** (value is the level name alone, accompanied by a key)
+
+    Example values and their parsed components:
+
+    .. list-table::
+       :header-rows: 1
+
+       * - ``value`` field
+         - ``level``
+         - Request type
+       * - ``Level_7_RequestSeed``
+         - ``Level_7``
+         - RequestSeed
+       * - ``Supplier_RequestSeed``
+         - ``Supplier``
+         - RequestSeed
+       * - ``Supplier``
+         - ``Supplier``
+         - SendKey
+
+    **RequestSeed service name resolution**
+
+    The CDA resolves the UDS RequestSeed service (SID 27\ :sub:`16`) by searching all SID
+    27\ :sub:`16` services in the ISO 14229-1 RequestSeed subfunction range (odd subfunctions
+    1, 3-5, 7-41, exactly 2 request parameters) and selecting the first whose short name
+    **contains** the level name (underscores stripped, case-insensitive).
+
+    This requires the level name to be embedded in the service short name, which both supported
+    naming conventions satisfy:
+
+    * **Level-encoded names** (e.g. ``RequestSeed_Level_3``): the level substring ``Level3``
+      is contained in the short name.
+    * **Semantic label names** (e.g. ``RequestSeed_Supplier``): the label ``Supplier`` is
+      both the level name and the label in the short name.
+
+    .. list-table:: Naming convention examples
+       :header-rows: 1
+
+       * - Short name in description
+         - Subfunction
+         - Level value
+         - Resolved by
+       * - ``RequestSeed_Level_3``
+         - 0x03
+         - ``Level_3``
+         - level substring ``Level3`` found in short name
+       * - ``RequestSeed_Level_7``
+         - 0x07
+         - ``Level_7``
+         - level substring ``Level7`` found in short name
+       * - ``RequestSeed_Supplier``
+         - 0x09
+         - ``Supplier``
+         - level substring ``Supplier`` found in short name
+
+    .. uml:: images/security_access.puml
+
+
+Authentication -- SID 29\ :sub:`16`
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. arch:: Authentication Endpoints
+    :id: arch~sovd-api-authentication-modes
+    :status: draft
+
+    .. note::
+       This is technically a deviation from Table 343 in the ISO API. The table in the ISO is misleading, since 8.3.2 and 8.3.3 describe them separately.
+
+    The endpoints are available under ``/modes/authentication``. A ``PUT`` call needs to provide a request body containing
+    ``value`` with the desired subfunction (names are determined by the UDS standard), and a ``parameters`` field containing all request parameters.
+
+    Diagnostic data descriptions have to specify the used services including the subfunction individually, so the
+    request parameters can be converted into UDS payloads.
+
+    .. uml:: images/authentication.puml
+
+
+Communication Control -- SID 28\ :sub:`16`
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. arch:: Communication Control Endpoints
+    :id: arch~sovd-api-communication-control-modes
+    :status: draft
+
+    To control the communication parameters of an ECU, the path ``/modes/commctrl`` is offered, which can be called
+    similarly to Session (without expiration).
+
+    The attribute ``value`` allows the following subfunction names based on the UDS standard:
+
+    * ``enableRxAndEnableTx``
+    * ``enableRxAndDisableTx``
+    * ``disableRxAndEnableTx``
+    * ``disableRxAndDisableTx``
+
+    Matching 28\ :sub:`16` service entries must be present in the diagnostic description. Parameters can be provided
+    through an additional ``parameters`` attribute.
+
+    .. note::
+       Other values are not supported.
+
+    .. uml:: images/communication_control.puml
+
+
+DTC Setting -- SID 85\ :sub:`16`
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. arch:: DTC Setting Endpoints
+    :id: arch~sovd-api-dtc-setting-modes
+    :status: draft
+
+    To control the DTC settings of an ECU, the path ``/modes/dtcsetting`` is offered, which can be called
+    similarly to Session (without expiration).
+
+    The attribute ``value`` allows the values ``off`` and ``on``, to call the corresponding subfunctions on the ECU.
+
+    Matching 85\ :sub:`16` service entries must be present in the diagnostic description. Parameters can be provided
+    through an additional ``parameters`` attribute.
+
+    .. note::
+       Other specific extensions to the values are not supported.
+
+    .. uml:: images/dtc_setting.puml
+
+
+Faults -- SID 14\ :sub:`16` & 19\ :sub:`16`
+-------------------------------------------
+
+.. arch:: Faults endpoint
+    :id: arch~sovd-api-faults-endpoint
+    :status: draft
+
+    The following operations must be implemented:
+
+    .. list-table:: Faults endpoints
+       :header-rows: 1
+
+       * - Method
+         - Path
+         - Description
+       * - GET
+         - ``/faults``
+         - Retrieves a list of DTCs stored in the ECU:
+
+           - To filter the DTCs, the query parameter ``status`` can be used.
+       * - GET
+         - ``/faults/<dtc>``
+         - Retrieves detailed information about the DTC:
+
+           - Can include snapshot and extended data within the ``environment_data`` object, when the query parameter
+             ``include-extended-data`` or ``include-snapshot`` are set to true.
+       * - DELETE
+         - ``/faults``
+         - Clears all DTCs stored in the ECU
+       * - DELETE
+         - ``/faults/<dtc>``
+         - Clears the provided DTC from the ECU
+
+    The query parameter ``status[<key>]=<value>`` can be used to query/filter the returned DTCs based on their status.
+    It can be used multiple times to combine different status flags. The values correspond to the DTC status bits
+    defined in ISO 14229-1.
+
+    Available keys:
+
+    - confirmedDtc
+    - pendingDtc
+    - testFailed
+    - testFailedSinceLastClear
+    - testFailedThisOperationCycle
+    - testNotCompletedSinceLastClear
+    - testNotCompletedThisOperationCycle
+    - warningIndicatorRequested
+
+    All values are either boolean values (true/false), or a bit value (0/1).
+
+    Additionally, a special key called ``mask`` is available, which takes a hexadecimal mask as a value
+    to allow filtering by the complete status byte. Using other keys together with ``mask`` is not supported.
+
+    .. uml:: images/fault_read.puml
+
+
+Locks
+-----
+
+.. arch:: Lock API
+    :id: arch~sovd-api-lock-api
+    :status: draft
+
+    All three lock scopes share the same CRUD API shape. The scope paths are:
+
+    - Vehicle: ``/locks``
+    - ECU: ``/components/{ecu-name}/locks``
+    - Functional group: ``/functions/functionalgroups/{group-name}/locks``
+
+    **Request fields (POST / PUT)**
+
+    .. list-table::
+       :header-rows: 1
+       :widths: 25 20 55
+
+       * - Field
+         - Type
+         - Description
+       * - ``lock_expiration``
+         - unsigned integer
+         - Duration in seconds from the current time. The absolute expiration instant is
+           computed at request time.
+       * - ``break_lock``
+         - boolean (optional, default ``false``)
+         - Whether an existing lock shall be broken/preempted. See
+           :need:`arch~sovd-api-lock-priority`.
+       * - ``x-sovd2uds-isexclusive``
+         - boolean (optional, default: configurable)
+         - Selects exclusive or non-exclusive enforcement mode. See
+           :need:`arch~sovd-api-lock-exclusivity-policy`.
+       * - Other properties
+         - any (optional)
+         - Passed verbatim to the priority plugin. Shape is vendor-defined.
+
+    **Response fields (POST / PUT)**
+
+    ``id`` (UUID string), ``owned`` (boolean, always ``true`` for the creating client).
+
+    A POST that creates a lock returns HTTP 201 and a relative ``Location`` header for the new
+    lock resource. For compatibility with existing CDA clients, POST by the owner of the active
+    lock renews that lock and returns HTTP 200 with its representation and no ``Location`` header.
+    This does not create an independent lock resource. Clients should use PUT on
+    ``/locks/{lock-id}`` to modify an existing lock's expiration; successful PUT returns HTTP 204.
+
+    **Response fields (GET /locks/{id})**
+
+    ``lock_expiration`` (ISO 8601 string) and ``x-sovd2uds-isexclusive`` (boolean). For defunct
+    locks: additionally ``x-sovd2uds-broken-by`` (string), ``x-sovd2uds-broken-at`` (ISO 8601 string), and
+    ``x-sovd2uds-current-holder`` (string, the identity of the current lock holder).
+
+
+.. arch:: Lock Exclusivity
+    :id: arch~sovd-api-lock-exclusivity
+    :status: draft
+
+    The ``x-sovd2uds-isexclusive`` boolean from the POST/PUT request body is stored as a field on the
+    lock object. If the request body omits the field, the value determined by the
+    configured ``lock_exclusivity_policy`` is substituted before storing it (see
+    :need:`arch~sovd-api-lock-exclusivity-policy`). When a request arrives at a
+    communication endpoint the stored flag is read to select the enforcement level applied
+    by :need:`arch~sovd-api-lock-ecu-enforcement` and
+    :need:`arch~sovd-api-lock-fg-enforcement`.
+
+
+.. arch:: Lock Exclusivity Policy
+    :id: arch~sovd-api-lock-exclusivity-policy
+    :status: draft
+
+    The configured ``lock_exclusivity_policy`` selects the value substituted for
+    ``x-sovd2uds-isexclusive`` whenever a lock POST or PUT request body omits that field,
+    before the resulting value is stored on the lock object (see
+    :need:`arch~sovd-api-lock-exclusivity`):
+
+    - ``exclusive_by_default`` (default): the substituted value is ``true``.
+    - ``non_exclusive_by_default``: the substituted value is ``false``.
+
+    The substitution is performed identically for the vehicle, ECU, and functional group
+    lock handlers.
+
+    Being enum-typed, this configuration option is designed to accommodate additional
+    exclusivity policies in the future without changing its name or structure.
+
+    Requests that explicitly include ``x-sovd2uds-isexclusive`` bypass the substitution
+    and use the provided value unchanged.
+
+
+.. arch:: Lock Expiration
+    :id: arch~sovd-api-lock-expiration
+    :status: draft
+
+    When a lock is created, a background task is spawned that fires at the computed
+    absolute expiration instant. On firing, the task acquires the write lock on the lock
+    map, confirms the stored lock ID still matches (guarding against a race with an extend
+    or a preemption), invokes the lock's cleanup function, and removes it from the map.
+
+    On ``PUT /locks/{id}`` (extend), the existing background task is aborted and a new one
+    is spawned for the updated instant.
+
+    On explicit ``DELETE /locks/{id}`` the background task is aborted before the cleanup
+    function is called, preventing a double-cleanup.
+
+    Defunct locks retain their original expiration task, but the task only removes the
+    defunct entry from the defunct store without invoking cleanup.
+
+
+.. arch:: ECU Lock Endpoint Enforcement
+    :id: arch~sovd-api-lock-ecu-enforcement
+    :links: arch~sovd-api-lock-exclusivity, arch~sovd-api-lock-defunct-enforcement
+    :status: draft
+
+    A ``validate_lock`` check is applied at the entry of every ECU communication endpoint.
+    The check proceeds as follows:
+
+    .. uml::
+        :caption: ECU Lock Enforcement Decision
+
+        @startuml
+        skinparam backgroundColor #FFFFFF
+        skinparam defaultTextAlignment center
+
+        start
+
+        :Identify caller from JWT claims;
+
+        if (Caller owns a defunct lock\nfor this ECU?) then (yes)
+          :HTTP 409 (Conflict);
+          stop
+        endif
+
+        if (Active lock held by\nanother client?) then (yes)
+          if (Lock is exclusive, or\nwrite operation?) then (yes)
+            :HTTP 423 (Locked);
+            stop
+          else (non-exclusive and read)
+            :Proceed;
+            stop
+          endif
+        else (no active lock by another)
+          if (Caller owns active ECU lock\nor vehicle lock?) then (yes)
+            :Proceed;
+            stop
+          else (no lock held by caller)
+            if (Write operation?) then (yes)
+              :HTTP 409 (Conflict\n- lock required);
+              stop
+            else (read)
+              :Proceed;
+              stop
+            endif
+          endif
+        endif
+
+        @enduml
+
+    The check accepts a vehicle lock owned by the caller as equivalent to owning the ECU
+    lock, granting full write access.
+
+
+.. arch:: Functional Group Lock Endpoint Enforcement
+    :id: arch~sovd-api-lock-fg-enforcement
+    :links: arch~sovd-api-lock-exclusivity, arch~sovd-api-lock-defunct-enforcement
+    :status: draft
+
+    A ``validate_fg_lock`` check is applied at the entry of every functional group
+    communication endpoint. It follows the same decision logic as
+    :need:`arch~sovd-api-lock-ecu-enforcement`, operating on the functional group lock
+    and the functional group endpoints (``/data``, ``/operations``, ``/modes``).
+
+    See also :need:`arch~sovd-api-functional-communication-locks` for the Tester Present
+    side-effects associated with acquiring and releasing a functional group lock.
+
+
+.. arch:: Lock Requirement Policy
+    :id: arch~sovd-api-lock-requirement-policy
+    :links: arch~sovd-api-lock-ecu-enforcement, arch~sovd-api-lock-fg-enforcement
+    :status: draft
+
+    The configured ``lock_requirement_policy`` selects a variant of the decision logic
+    used by ``validate_lock`` and ``validate_fg_lock`` (see
+    :need:`arch~sovd-api-lock-ecu-enforcement`):
+
+    - ``require_for_write_operations`` (default): the decision logic is unchanged from
+      :need:`arch~sovd-api-lock-ecu-enforcement` / :need:`arch~sovd-api-lock-fg-enforcement`.
+    - ``require_for_all_operations``: the branch that otherwise allows read operations to
+      proceed when no active lock is held by anyone is replaced with a rejection
+      (HTTP 409, Conflict), for both ECU-scoped and functional-group-scoped endpoints.
+
+    All other branches of the decision logic -- defunct lock pre-check, exclusive/
+    non-exclusive handling while a lock is held by another client, and the vehicle-lock
+    equivalence check -- are unaffected by this option.
+
+    Being enum-typed, this configuration option is designed to accommodate additional
+    requirement policies in the future without changing its name or structure.
+
+
+.. arch:: Lock Acquisition Policy
+    :id: arch~sovd-api-lock-acquisition-policy
+    :status: draft
+
+    The ECU lock POST handler and the functional group lock POST handler each evaluate the
+    configured ``lock_acquisition_policy`` before creating the child lock, in addition to
+    the existing vehicle-lock ownership check described in
+    :need:`arch~sovd-api-lock-vehicle-blocking`.
+
+    - ``unrestricted`` (default): no additional check is performed; behavior is as
+      described in :need:`arch~sovd-api-lock-vehicle-blocking`.
+    - ``vehicle_lock_required``: the handler first checks whether an active vehicle lock
+      currently exists, independent of its owner. If none exists, the request is rejected
+      with HTTP 409 (Conflict) before the vehicle-lock ownership check is evaluated. If a
+      vehicle lock exists, processing continues as normal, including the ownership check
+      from :need:`arch~sovd-api-lock-vehicle-blocking`.
+
+    Being enum-typed, this configuration option is designed to accommodate additional
+    acquisition policies in the future without changing its name or structure.
+
+
+.. arch:: Vehicle Lock Blocks Child Lock Acquisition
+    :id: arch~sovd-api-lock-vehicle-blocking
+    :status: draft
+
+    The ECU lock POST handler and the functional group lock POST handler each check for an
+    active vehicle lock before creating the child lock. If a vehicle lock is present and
+    owned by a different client the request is rejected with HTTP 409.
+
+    If the vehicle lock is held by the same caller, or if no vehicle lock is held, the
+    child lock creation proceeds normally.
+
+
+.. arch:: Lock Priority Mechanism Interface
+    :id: arch~sovd-api-lock-priority
+    :links: arch~sovd-api-lock-defunct
+    :status: draft
+
+    The registered priority mechanism verifies vendor-specific metadata before every lock POST
+    request is processed. This verification applies to vehicle, ECU, and functional group locks,
+    including uncontended acquisitions and same-owner POST renewals. The CDA treats the metadata
+    as opaque and delegates its schema and semantic validation to the vendor mechanism.
+
+    When a vehicle lock POST request arrives and a lock is already held by a different client,
+    the priority mechanism is additionally invoked to evaluate preemption before returning HTTP
+    423.
+
+    **Mechanism input**
+
+    - JWT claims of the requesting client
+    - The identity of the current lock holder, as well as the original properties
+      (TODO: probably better to send all locks to mechanism and let mechanism handle it?)
+
+    **Mechanism output**
+
+    - ``granted: bool`` -- whether the requesting client has sufficient priority to preempt
+    - ``broken_by: String`` -- the identity string to record in the defunct lock's
+      ``x-sovd2uds-broken-by`` field (typically the requesting client's JWT ``sub``, but
+      the exact value is determined by the plugin)
+
+    If ``granted`` is ``true``, the existing lock is transitioned to defunct state (see
+    :need:`arch~sovd-api-lock-defunct`) and a new lock is created for the requesting
+    client. If no mechanism is registered the handler returns HTTP 409 as normal.
+
+
+.. arch:: Defunct Lock Lifecycle
+    :id: arch~sovd-api-lock-defunct
+    :status: draft
+
+    When preemption is granted by the priority mechanism:
+
+    1. The current active lock is marked defunct: a ``defunct`` flag is set on the lock
+       object along with ``broken_by`` (string returned by the mechanism) and ``broken_at``
+       (current UTC timestamp).
+    2. The defunct lock is moved from the active lock slot to a separate per-entity defunct
+       store. The active slot is now free for the new lock.
+    3. The defunct lock's original expiration task is **not** aborted. When it fires it
+       removes the defunct entry from the defunct store without invoking any cleanup
+       function.
+    4. A new lock is created for the preempting client and placed in the active slot with
+       its own expiration task and cleanup function.
+
+    ``GET /locks`` returns both the active lock and any defunct locks for the entity.
+    Defunct lock entries carry ``x-sovd2uds-broken-by``, ``x-sovd2uds-broken-at``, and
+    ``x-sovd2uds-current-holder`` in addition to the standard fields.
+
+
+.. arch:: HTTP 409 for Preempted Clients
+    :id: arch~sovd-api-lock-defunct-enforcement
+    :status: draft
+
+    The ``validate_lock`` and ``validate_fg_lock`` checks are extended with a pre-check
+    that runs before the existing ownership and exclusivity evaluation:
+
+    1. Look up the defunct store for the target entity.
+    2. If any defunct lock in that store is owned by the calling client, return HTTP 409
+       immediately.
+
+    This pre-check takes precedence over the HTTP 409 or HTTP 423 that would otherwise be
+    returned for a missing or non-owned active lock.
+
+
+Generic Service
+---------------
+
+.. arch:: Generic Service Endpoint
+    :id: arch~sovd-api-generic-service
+    :status: draft
+
+    The ``/genericservice`` endpoint provides raw UDS passthrough functionality, allowing clients to send
+    arbitrary UDS requests to an ECU without relying on diagnostic description (MDD) service resolution
+    or parameter encoding.
+
+    The client sends a hex-encoded UDS request in the JSON body, and receives the raw hex-encoded UDS
+    response from the ECU.
+
+    Permissions for generic service calls can be checked and enforced through the security plugin. Since
+    generic service requests bypass the structured service resolution, the security plugin receives the
+    raw UDS request payload (e.g. ``22 F1 90``) and is responsible for evaluating whether the authenticated
+    client is authorized to send that specific UDS command to the target ECU.
+
+    .. uml:: images/generic_service.puml
+
+
+Version Endpoint
+----------------
+
+.. arch:: API Version Endpoint Registration Function
+    :id: arch~sovd-api-version-registration-function
+    :links: dimpl~sovd-api-version-endpoint
+    :status: draft
+
+    The CDA provides a version registration function that sets up version-related endpoints during
+    initialization.
+
+    **Registration Function**
+
+    The function accepts the following parameters: ``vendor_name``, ``implementation_version``, ``commit``,
+    ``build_date``.
+
+    It always registers the standard ``/version-info`` endpoint, and optionally registers the default
+    ``/data/version`` and ``/apps/sovd2uds/data/version`` endpoints.
+
+    The fields ``base_uri`` and ``api_version`` are determined by the function.
+
+    **Standard Endpoint: /version-info**
+
+    The ``/version-info`` endpoint (without version prefix) returns a JSON response per ISO 17978-3 §7.4.1:
+
+    .. code-block:: json
+
+        {
+            "sovd_info": [
+                {
+                    "version": "<sovd_api_version>",
+                    "base_uri": "<relative uri-reference to base of sovd_api_version>",
+                    "vendor_info": {
+                        "name": "<vendor_name>",
+                        "version": "<implementation_version>",
+                        "commit": "<commit>",
+                        "build_date": "<build_date>"
+                    }
+                }
+            ]
+        }
+
+    **Optional Vendor-Specific Endpoints: /data/version, /apps/sovd2uds/data/version**
+
+    When enabled, these endpoints are registered as static data endpoints returning:
+
+    .. code-block:: json
+
+        {
+            "id": "version",
+            "data": {
+                "name": "<vendor_name>",
+                "api": {
+                    "version": "<api_version>"
+                },
+                "implementation": {
+                    "version": "<implementation_version>",
+                    "commit": "<commit>",
+                    "build_date": "<build_date>"
+                }
+            }
+        }
+
+    Both endpoint types are available immediately after the HTTP server starts and do not require
+    any ECU communication.
+
+    .. uml:: images/version_registration.puml
+
+    .. note:: The current implementation only registers ``/data/version`` and ``/apps/sovd2uds/data/version``
+
+Error Codes & Messages
+----------------------
+
+.. note:: todo define

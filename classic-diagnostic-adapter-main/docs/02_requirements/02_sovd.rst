@@ -1,0 +1,1198 @@
+.. SPDX-FileCopyrightText: 2026 Copyright (c) Contributors to the Eclipse Foundation
+..
+.. See the NOTICE file(s) distributed with this work for additional
+.. information regarding copyright ownership.
+..
+.. This program and the accompanying materials are made available under the
+.. terms of the Apache License Version 2.0 which is available at
+.. https://www.apache.org/licenses/LICENSE-2.0
+..
+.. SPDX-License-Identifier: Apache-2.0
+
+SOVD (ISO 17978-1)
+==================
+
+The guiding principle behind this document is to specify the requirements for an ISO 17978-1 compatible API in the Eclipse OpenSOVD Classic Diagnostic Adapter (CDA).
+
+General
+-------
+
+Paths and parameter names should be case-insensitive, unless otherwise mentioned.
+
+HTTP(S)
+-------
+
+.. req:: HTTP-Server
+    :id: req~sovd-api-http-server
+    :links: arch~sovd-api-http-server
+    :status: draft
+
+    The CDA must provide an HTTP- or HTTPS-server.
+
+    The HTTP Server has to support multiple connections, and calls should be handled asynchronously.
+
+    **Rationale**
+
+    Multiple clients might use the CDA at the same time, and asynchronous handling generally improves performance due to reduced thread count.
+
+
+.. req:: HTTP-Server-Port
+    :id: req~sovd-api-http-server-port
+    :status: draft
+
+    The HTTP- or HTTPS-Server port must be configurable.
+
+
+.. req:: HTTP-Server Unix Domain Socket
+    :id: req~sovd-api-http-server-unix-socket
+    :links: arch~sovd-api-http-server
+    :status: draft
+
+    The CDA must support binding the HTTP(S) server to a Unix domain socket path as an
+    alternative to a TCP host/port, so that it can be reached only by co-located processes
+    through filesystem permissions instead of network exposure.
+
+    When a Unix domain socket path is configured, it takes priority over the TCP
+    host/port configuration; the two are not combined.
+
+    **Rationale**
+
+    Restricting the server to a Unix domain socket allows the CDA to be exposed only to a
+    co-located process (e.g. a gateway), without needing to allocate or expose a TCP port.
+
+
+.. req:: HTTPS-Server configuration
+    :id: req~sovd-api-https-server-configuration
+    :status: draft
+
+    In case of HTTPS, the certificate/key must be providable through the configuration, or a plugin.
+
+    **Rationale**
+
+    Certificates/Keys might be stored in an HSM, therefore platform specific code might be needed for access.
+
+    .. todo:: Maybe connection establishment/encryption also needs to be done through HSM?
+
+
+API
+---
+
+Entities
+^^^^^^^^
+
+.. req:: Entity Data Types
+    :id: req~sovd-api-data-types-mapping-iso17978
+    :links: arch~sovd-api-data-types-mapping-iso17978
+    :status: draft
+
+    Data types must be mapped as specified by ISO 17978-3.
+
+    Additionally, for the data type ``A_BYTEFIELD``, the format ``hex`` must be supported - see :ref:`requirements_sovd_api_bytefield_as_hex`.
+
+Paths
+^^^^^
+
+.. req:: Components Entity Collection
+    :id: req~sovd-api-components-entity-collection
+    :links: arch~sovd-api-components-entity-collection
+    :status: draft
+
+    The CDA must provide a ``/components`` endpoint that exposes the available ECUs as an entity collection.
+
+    Each ECU with a loaded diagnostic description (MDD file) must be represented as an entity in the collection.
+
+    - A ``GET`` on ``/components`` must return a list of all available ECU entities, with each ECU having the following properties:
+      - ``id`` - Identifier of the ECU (as used in path, typically lower-case ecu name)
+      - ``name`` - Name of the ECU as in the diagnostic description
+      - ``href`` - uri-reference to the ECUs standardized resource collection
+
+    **Rationale**
+
+    The ``/components`` endpoint provides the entry point for clients to discover the available ECUs and their capabilities. This is the primary mechanism for a client to enumerate the diagnostic targets accessible through the CDA.
+
+
+.. req:: Standardized Resource Collection Mapping
+    :id: req~sovd-api-standardized-resource-collection-mapping
+    :links: arch~sovd-api-standardized-resource-collection-mapping
+    :status: draft
+
+    The standardized resource collection for ``/components/{ecu-name}`` must be mapped as follows:
+
+    .. list-table:: UDS SID to REST path mapping
+       :header-rows: 1
+       :widths: 15 45 40
+
+       * - SID (base 16)
+         - REST path
+         - Comment
+       * - 10
+         - /modes/session
+         -
+       * - 11
+         - | /operations/reset
+           | /status/restart
+         -
+       * - | 14
+           | 19
+         - /faults/
+         -
+       * - | 22
+           | 2E
+         - | /data/{data-identifier}
+           | /configurations/{data-identifier}
+         - | Classification between ``/data`` and ``/configurations`` is handled by mapping the ODX functional
+           | class to a category (for ``/data``) or to the ``/configurations`` path, via configuration.
+           | See :need:`arch~sovd-api-functional-class-mapping`.
+       * - 27
+         - /modes/security
+         -
+       * - 28
+         - /modes/commctrl
+         -
+       * - 29
+         - /modes/authentication
+         -
+       * - 31
+         - /operations/{routine-identifier}
+         -
+       * - | 34
+           | 36
+           | 37
+         - | /x-sovd2uds-download/requestdownload
+           | /x-sovd2uds-download/flashtransfer
+           | /x-sovd2uds-download/transferexit
+         - ``flashtransfer`` handles the whole transfer, not for individual calls
+       * - 3E
+         - --
+         - handled internally by CDA
+       * - 85
+         - /modes/dtcsetting
+         -
+
+    NOTE: The mapping in ISO standard is inconsistent w.r.t. ``/modes/security`` and ``/modes/authentication``
+
+    **Query Parameters**
+
+    The CDA must support the optional query parameter ``x-sovd2uds-includesdgs`` (alias ``x-include-sdgs``) to be able to
+    include a list of SDG/SD properties of the ECU - see :need:`req~sovd-api-component-sdgsd`.
+
+.. req:: Data Categories Endpoint
+    :id: req~sovd-api-data-categories-endpoint
+    :links: arch~sovd-api-data-categories-endpoint
+    :status: draft
+
+    The CDA must provide a ``GET /components/{ecu-name}/data-categories`` endpoint returning the list of data
+    categories supported by that ECU, as specified by ISO 17978-3.
+
+    **Rationale**
+
+    Allows an SOVD client to discover which categories are actually in use for a given ECU without having to
+    enumerate and inspect every entry of ``/data`` first.
+
+.. req:: Data Groups Endpoint
+    :id: req~sovd-api-data-groups-endpoint
+    :links: arch~sovd-api-data-groups-endpoint
+    :status: draft
+
+    The CDA must provide a ``GET /components/{ecu-name}/data-groups`` endpoint returning the list of groups defined
+    for that ECU's data resources, optionally filtered by the ``category`` query parameter, as specified by ISO
+    17978-3.
+
+    **Rationale**
+
+    Allows an SOVD client to discover related data resources (e.g. all values belonging to "engine performance")
+    without relying on category alone, and to filter that discovery by category.
+
+.. req:: Data Query Filtering
+    :id: req~sovd-api-data-query-filtering
+    :links: arch~sovd-api-data-query-filtering
+    :status: draft
+
+    The CDA must support the optional query parameters ``categories`` and ``groups`` on
+    ``GET /components/{ecu-name}/data``, to filter the returned data resources by category or by group
+    respectively, as specified by ISO 17978-3. If both are provided, ``groups`` takes precedence and
+    ``categories`` must be ignored.
+
+.. req:: Component SDG/SDs
+    :id: req~sovd-api-component-sdgsd
+    :links: arch~sovd-api-component-sdgsd
+    :status: draft
+
+    The CDA must return the Special Data Groups (SDGs) and Special Data (SDs) from the diagnostic description when the
+    optional query parameter ``x-sovd2uds-includesdgs`` (alias ``x-include-sdgs``) is set to ``true``.
+
+    This query parameter must be supported on:
+
+    - ``GET /components/{ecu-name}`` -- returns the ECU-level SDGs in an ``sdgs`` property on the component response.
+    - ``GET /components/{ecu-name}/data/{data-identifier}`` -- returns the service-level SDGs instead of the normal data response.
+    - ``GET /components/{ecu-name}/operations/{operation-identifier}`` -- returns the service-level SDGs instead of the normal data response.
+
+    The ``sdgs`` property must contain a list of SDG/SD entries. Each entry is either:
+
+    - An **SD** (Special Data) with the following optional fields:
+
+      - ``value`` -- the value of the SD
+      - ``si`` -- semantic information (description)
+      - ``ti`` -- text information
+
+    - An **SDG** (Special Data Group) with the following optional fields:
+
+      - ``caption`` -- the name of the SDG
+      - ``si`` -- semantic information (description)
+      - ``sdgs`` -- a nested list of SD and SDG entries (recursive structure)
+
+    When no SDGs are available for the requested resource, the ``sdgs`` property must be an empty list or omitted.
+
+    **Rationale**
+
+    SDGs carry vendor-specific metadata from the diagnostic description (e.g. bus interface type, AUTOSAR version) that
+    clients may need for display or decision-making purposes. Making them opt-in through a query parameter avoids
+    unnecessary overhead in the default response.
+
+
+.. req:: Explicit ECU Variant Detection
+    :id: req~sovd-api-ecu-variant-detection
+    :links: arch~sovd-api-ecu-variant-detection
+    :status: draft
+
+    The CDA must support ECU variant detection through a ``PUT`` on the ``/components/{ecu-name}`` endpoint.
+    An additional endpoint under operations may be provided to trigger the detection.
+
+    **Rationale**
+
+    Some ECUs have different variants, which support different functionality. To provide the correct functionality,
+    the CDA needs to be able to detect the variant in use. This variant may change at any point due to the nature of
+    the ECUs software. Clients may need to trigger this explicitly to ensure correct functionality.
+
+
+Operations
+""""""""""
+
+.. req:: Operations Handling
+    :id: req~sovd-api-operations-handling
+    :links: arch~sovd-api-operations-handling
+    :status: draft
+
+    Operations (Routines SID 31\ :sub:`16`) can be synchronous or asynchronous. Asynchronous routines are routines, for which the ``RequestResults`` and/or ``Stop`` subfunctions are defined.
+
+    The order of operations:
+
+    1. ``POST /executions`` for *Start* (subfunction 01)
+    2. ``GET /executions/{id}`` for *RequestResults* (subfunction 03)
+    3. ``DELETE /executions/{id}`` for *Stop* (subfunction 02).
+
+    **Synchronous routines**
+
+    The `POST` to executions will directly return the result - either a 200 with the data, or an error.
+
+    Example of a successful call:
+
+    .. code:: javascript
+
+        {
+          "parameters": {
+              "key": "value"
+          }
+        }
+
+
+    **Asynchronous routines**
+
+    Since the response of the ``Start`` subfunction, as well as an id for polling the ``RequestResults``
+    subfunction are required, both must be returned.
+
+    Example of a successful call:
+
+    .. code:: javascript
+
+        {
+          "id": "<id of created execution>",
+          "status": "running",
+          "parameters": {
+              "key": "value"
+          }
+        }
+
+    A positive ``Start`` response creates the execution even when individual response fields cannot
+    be decoded. Successfully decoded fields shall be returned in ``parameters`` and decoding errors
+    shall be returned as ``DataError`` entries in ``errors``. Each error path shall identify the
+    affected ``parameters`` field. If the complete response cannot be decoded, ``parameters`` shall
+    be empty and the error path shall point to ``/parameters``.
+
+    Example with a response decoding error:
+
+    .. code:: javascript
+
+        {
+          "id": "<id of created execution>",
+          "status": "running",
+          "parameters": {},
+          "errors": [
+            {
+              "path": "/parameters",
+              "error": {
+                "message": "Failed to parse Start response",
+                "error_code": "invalid-response-content"
+              }
+            }
+          ]
+        }
+
+
+    Should the call to the ``Start`` subfunction fail before a positive response is received, for
+    example due to an NRC or a communication error, no ``id`` for polling is created.
+
+    There are however use-cases, in which you may want to call ``RequestResults`` or ``Stop`` independently, or there could
+    only be partial definitions (e.g. only Stop). For this use case the extension :ref:`requirements_sovd_api_operation_order` is required.
+
+Faults
+""""""
+
+.. req:: Faults Endpoint
+    :id: req~sovd-api-faults-endpoint
+    :links: arch~sovd-api-faults-endpoint
+    :status: draft
+
+    The CDA must provide a ``/faults`` endpoint to retrieve DTCs in accordance with ISO 17978-3.
+
+
+Extensions to the ISO specification
+-----------------------------------
+
+.. _requirements_sovd_api_bytefield_as_hex:
+
+Data Type A_BYTEFIELD as Hex
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. req:: Data Type A_BYTEFIELD as Hex
+    :id: req~sovd-api-bytefield-as-hex
+    :status: draft
+
+    For the data type ``A_BYTEFIELD`` the json output type ``string`` with the format ``hex`` must be supported
+    through an optional query-parameter. Using ``hex`` means, that the binary data must be base16-encoded,
+    either with or without preceding ``0x`` prefixes.
+
+    **Rationale**
+
+    Handling base64 encoded binary directly can be a compatibility challenge for offboard testers accessing the
+    CDA. Manual debugging can also be simplified by directly seeing the hexadecimal encoded data, since it's
+    easier to process for humans.
+
+.. _requirements_sovd_api_mimetype_octet_stream:
+
+Support for mimetype application/octet-stream
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. req:: Support for mimetype application/octet-stream
+    :id: req~sovd-api-octet-stream-support
+    :status: draft
+
+    The ``/data/{data-identifier}`` and ``/operations/{routine-identifier}`` endpoints must support the additional mimetype octet-stream where applicable, to allow clients to send and receive payloads as binary data.
+
+    NOTE: Only the payload is sent/received. The SID & DID/RID are derived from the path, and in case of NRCs only the NRC code (single byte) is sent back with a HTTP 502.
+
+    **Rationale**
+
+    This requirement simplifies the use of the CDA as a diagnostic tester and in migration scenarios.
+
+Version Info Endpoint
+^^^^^^^^^^^^^^^^^^^^^
+
+.. req:: Version Info Endpoint
+    :id: req~sovd-api-version-info-endpoint
+    :links: arch~sovd-api-version-registration-function
+    :status: draft
+
+    The CDA must provide a ``/version-info`` endpoint (without version prefix) as specified in ISO 17978-3 §7.4.1.
+
+    The endpoint shall return a JSON response containing ``sovd_info``, an array of objects describing each
+    supported SOVD API version. Each entry shall contain:
+
+    .. list-table:: SOVDInfo fields
+       :header-rows: 1
+
+       * - Field
+         - Type
+         - Description
+       * - version
+         - string
+         - The supported SOVD standard version (semantic version string)
+       * - base_uri
+         - string (uri-reference)
+         - The version-specific base URI for interacting with the SOVD server
+       * - vendor_info
+         - object
+         - Vendor-specific information about the SOVD server implementation
+
+    The ``vendor_info`` object shall contain:
+
+    .. list-table:: VendorInfo fields
+       :header-rows: 1
+
+       * - Field
+         - Type
+         - Description
+       * - name
+         - string
+         - The vendor/implementation name of the SOVD server
+       * - version
+         - string
+         - The software version of the implementation
+       * - commit
+         - string
+         - The Git commit hash of the build
+       * - build_date
+         - string
+         - The date the binary was built
+
+    The path to the ``version-info`` resource shall remain the same for all future versions of the SOVD API.
+
+    **Rationale**
+
+    Allows SOVD clients to discover which API versions are supported by the server before
+    attempting to access version-specific resources.
+
+
+.. req:: Version Data Endpoint
+    :id: req~sovd-api-version-endpoint
+    :links: arch~sovd-api-version-registration-function
+    :status: draft
+
+    The CDA may optionally provide vendor-specific version data endpoints at ``/data/version`` and
+    ``/apps/sovd2uds/data/version``. These endpoints return implementation details in the existing
+    static data format (``id`` + ``data`` object containing ``name``, ``api.version``, and
+    ``implementation.version``/``commit``/``build_date``).
+
+    These endpoints are registered by the same registration function that provides the standard
+    ``/version-info`` endpoint.
+
+    **Rationale**
+
+    Provides a convenient vendor-specific endpoint for tooling that expects implementation details
+    in a structured data format without needing to parse the standard version-info response.
+
+
+.. req:: Version Registration Function
+    :id: req~sovd-api-version-registration-function
+    :links: arch~sovd-api-version-registration-function
+    :status: draft
+
+    A single registration function shall accept the following parameters:
+
+    - ``vendor_name``: the implementation/vendor name of the SOVD server
+    - ``api_version``: the supported SOVD API version string
+    - ``implementation_version``: the software version of the implementation
+    - ``commit``: the Git commit hash of the build
+    - ``build_date``: the date the binary was built
+    - ``base_uri``: the version-specific base URI
+
+    The function shall always register the ``/version-info`` endpoint.
+
+    The function shall optionally register the ``/data/version`` and ``/apps/sovd2uds/data/version``
+    endpoints serving vendor-specific implementation data.
+
+    **Rationale**
+
+    Centralizes version endpoint registration into a single callable unit, ensuring consistency
+    between the standard version-info response and optional vendor-specific endpoints.
+
+
+Health Endpoint
+^^^^^^^^^^^^^^^
+
+.. req:: Health Monitoring Endpoint
+    :id: req~sovd-api-health-endpoint
+    :links: arch~dt-health-monitoring
+    :status: draft
+
+    The CDA MAY provide a health monitoring endpoint as an optional build-time feature.
+
+    When the health monitoring feature is enabled:
+
+    - The CDA must expose a health endpoint on the HTTP server that reports the aggregate health status
+      of the application and its components
+    - Each major component (main application, database loader, DoIP gateway) must register a health
+      provider with granular status reporting
+    - Health status must reflect the current initialization and operational state of monitored components
+    - The health endpoint must be available immediately after the HTTP server starts, before
+      SOVD API routes are registered
+
+    When the health monitoring feature is disabled:
+
+    - The CDA must not expose any health endpoints
+    - The CDA may still use the health monitoring framework internally for logging or diagnostics, and for custom
+       plugins to use, but it must not be accessible externally through the CDA itself
+    - The absence of health monitoring must not affect any other CDA functionality
+
+    **Rationale**
+
+    Health monitoring enables external systems (e.g., container orchestrators, load balancers, or
+    monitoring systems) to observe CDA startup progress and operational status. Making this an optional
+    build-time feature allows deployments that do not require health monitoring to reduce the
+    application footprint and avoid unnecessary overhead.
+
+
+.. _requirements_sovd_api_operation_order:
+
+Support for non-standard operation order
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. req:: Support for non-standard operation order
+    :id: req~sovd-api-routine-operation-out-of-order
+    :status: draft
+
+    To support the use-case of calling ``RequestResults`` and ``Stop``, without having to call ``Start``,
+    the following boolean query parameters must be supported:
+
+    .. list-table:: UDS SID to REST path mapping
+       :header-rows: 1
+       :widths: 20 40 40
+
+       * - Method
+         - Parameter
+         - Description
+
+       * - All
+         - x-sovd2uds-suppressService
+         - Suppresses sending the routine to the ECU
+
+       * - DELETE
+         - x-sovd2uds-force
+         - Forces a DELETE operation to delete the id, regardless of an error the ecu might have reported for the `Stop` routine
+
+
+    When a REST call is initiated that needs to call the service on the ECU, but is missing the required
+    definition in the diagnostic description, and ``x-sovd2uds-suppressService`` isn't set to true,
+    the REST call must fail.
+
+
+.. _requirements_sovd_api_vehicle_api:
+
+Vehicle
+^^^^^^^
+
+A vehicle must support operations as a whole, to allow for operations which affect the whole vehicle, like updating
+mdd-files, or to prepare for operations which affect the whole vehicle (e.g. disabling vehicle communication).
+
+.. req:: Vehicle Level Operations
+    :id: req~sovd-api-vehicle-level-operations
+    :status: draft
+
+    Vehicle level operations must be supported in the CDA.
+    This requires a standardized resource collection in the exposed root path ``/``.
+
+    The standardized resource collection must provide the following resources:
+
+    .. list-table:: Standardized resource collection
+       :header-rows: 1
+       :widths: 30 70
+
+       * - Resource
+         - Description
+       * - locks
+         - Locks affecting the whole vehicle
+       * - functions
+         - Functions affecting the whole vehicle (i.e. communication disable/enable)
+
+
+.. _requirements_sovd_api_locks:
+
+Locks
+^^^^^
+
+Locks allow clients to claim exclusive or non-exclusive access to a diagnostic entity
+(vehicle, ECU, or functional group) and to coordinate diagnostic communication across
+multiple concurrent clients. The same CRUD API and enforcement semantics apply to all
+three lock scopes.
+
+.. req:: Lock API
+    :id: req~sovd-api-lock-api
+    :links: arch~sovd-api-lock-api
+    :status: draft
+
+    All three lock scopes -- vehicle (``/locks``), ECU (``/components/{ecu-name}/locks``),
+    and functional group (``/functions/functionalgroups/{group-name}/locks``) -- must expose
+    the following operations:
+
+    .. list-table:: Lock endpoints
+       :header-rows: 1
+       :widths: 10 40 50
+
+       * - Method
+         - Path
+         - Description
+       * - POST
+         - ``.../locks``
+         - Acquire a lock. For compatibility, if the caller already owns the active lock,
+           extend its expiration and return HTTP 200 instead. Clients should use PUT to modify
+           an existing lock's expiration.
+       * - GET
+         - ``.../locks``
+         - List active and defunct locks for the entity. The ``owned`` flag is relative to
+           the caller.
+       * - GET
+         - ``.../locks/{id}``
+         - Return expiration details for a specific lock.
+       * - PUT
+         - ``.../locks/{id}``
+         - Extend the expiration of an existing lock. Only the lock owner may call this.
+       * - DELETE
+         - ``.../locks/{id}``
+         - Release the lock. Only the lock owner may call this.
+
+    The request body for POST and PUT must support the following fields:
+
+    .. list-table:: Lock request fields
+       :header-rows: 1
+       :widths: 25 20 55
+
+       * - Field
+         - Type
+         - Description
+       * - ``lock_expiration``
+         - unsigned integer
+         - Duration in seconds from the time of the request after which the lock
+           automatically expires.
+       * - ``break_lock``
+         - boolean (optional, default ``false``)
+         - Whether an existing lock shall be broken/preempted. See :need:`req~sovd-api-lock-priority`.
+       * - ``x-sovd2uds-isexclusive``
+         - boolean (optional, default: configurable)
+         - Whether the lock is exclusive. See :need:`req~sovd-api-lock-exclusivity` and
+           :need:`req~sovd-api-lock-exclusivity-policy`.
+       * - any
+         - any (optional)
+         - Vendor-specific data passed to the vendor specific lock preemption mechanism.
+           See :need:`req~sovd-api-lock-priority`.
+
+    A POST that creates a lock must return HTTP 201 with a ``Location`` header referencing the
+    created lock. A same-owner compatibility renewal must return HTTP 200 without a ``Location``
+    header. Both POST responses must include ``id`` (UUID string) and ``owned`` (boolean, always
+    ``true`` for the requesting client). The GET ``/locks/{id}`` response must include
+    ``lock_expiration`` as an ISO 8601 string and ``owned`` relative to the requesting client.
+
+    Keys and Values must be case-insensitive.
+
+    **Rationale**
+
+    A unified lock API across all three scopes reduces client implementation complexity and
+    ensures consistent lock management regardless of the diagnostic entity type.
+
+
+.. req:: Lock Exclusivity
+    :id: req~sovd-api-lock-exclusivity
+    :links: arch~sovd-api-lock-exclusivity
+    :status: draft
+
+    A lock must be either exclusive or non-exclusive, controlled by the ``x-sovd2uds-isexclusive`` field
+    in the POST/PUT request body. When the field is omitted, the configured default applies
+    (see :need:`req~sovd-api-lock-exclusivity-policy`).
+
+    **Exclusive lock** (``x-sovd2uds-isexclusive: true``)
+
+    While an exclusive lock is held, all requests to the locked entity's ECU-communication
+    endpoints from clients that do not own the lock must be rejected with HTTP 423.
+
+    **Non-exclusive lock** (``x-sovd2uds-isexclusive: false``)
+
+    While a non-exclusive lock is held:
+
+    - Write and state-modifying requests from non-owning clients must be rejected with
+      HTTP 423.
+    - Read-only requests (``GET /data/{id}``, ``GET /faults``, ``GET /faults/{dtc}``)
+      remain accessible to any client.
+
+    **Rationale**
+
+    Non-exclusive locks allow monitoring or logging clients to continue reading diagnostic
+    data while a primary client holds the entity for active diagnostic communication.
+
+
+.. req:: Lock Exclusivity Policy
+    :id: req~sovd-api-lock-exclusivity-policy
+    :links: arch~sovd-api-lock-exclusivity-policy
+    :status: draft
+
+    The CDA must support a global configuration option, ``lock_exclusivity_policy``, that
+    determines the value applied to the ``x-sovd2uds-isexclusive`` field (see
+    :need:`req~sovd-api-lock-exclusivity`) when a lock POST or PUT request omits it. This
+    option is modeled as an enumeration to allow additional exclusivity policies to be
+    introduced in the future without renaming or restructuring the configuration option.
+
+    The following values must be supported:
+
+    .. list-table:: ``lock_exclusivity_policy`` values
+       :header-rows: 1
+       :widths: 25 75
+
+       * - Value
+         - Behavior
+       * - ``exclusive_by_default`` (default)
+         - A lock request that omits ``x-sovd2uds-isexclusive`` is treated as exclusive.
+       * - ``non_exclusive_by_default``
+         - A lock request that omits ``x-sovd2uds-isexclusive`` is treated as
+           non-exclusive.
+
+    This option applies globally across all three lock scopes (vehicle, ECU, and
+    functional group). Requests that explicitly set ``x-sovd2uds-isexclusive`` are
+    unaffected by this option.
+
+    **Rationale**
+
+    Defaulting to exclusive locks favors a safe-by-default posture, preventing accidental
+    concurrent access to a diagnostic entity when a client omits the exclusivity field.
+    Deployments that prefer the non-exclusive default, for example to support monitoring-friendly
+    workflows without requiring every client to set the field explicitly, may set this option to
+    ``non_exclusive_by_default``. Modeling the option as an enumeration keeps the configuration
+    surface future-proof for additional exclusivity policies without introducing further
+    boolean flags.
+
+
+.. req:: Lock Expiration
+    :id: req~sovd-api-lock-expiration
+    :links: arch~sovd-api-lock-expiration
+    :status: draft
+
+    Every lock must carry a positive expiration duration in seconds (``lock_expiration``
+    field).
+
+    - A zero or negative ``lock_expiration`` value must be rejected with HTTP 400.
+    - When the expiration elapses the CDA must automatically release the lock and execute
+      its associated cleanup actions (stop Tester Present, reset ECU session and security
+      access), unless a functional group lock of the same client still covers the ECU
+      (see :need:`req~uds-tester-present`), in which case no cleanup is executed.
+    - The lock owner may extend the expiration at any time before it elapses by issuing a
+      ``PUT`` on ``/locks/{id}``.
+
+    **Rationale**
+
+    Automatic expiration prevents abandoned locks from clients that disconnect unexpectedly
+    from blocking other clients indefinitely.
+
+
+.. req:: ECU Lock Endpoint Enforcement
+    :id: req~sovd-api-lock-ecu-enforcement
+    :links: arch~sovd-api-lock-ecu-enforcement
+    :status: draft
+
+    When an ECU lock is held, the following rules must apply to requests targeting that
+    ECU's communication endpoints. The caller's identity is determined from the JWT claims.
+
+    .. list-table:: ECU lock enforcement rules
+       :header-rows: 1
+       :widths: 42 29 29
+
+       * - Condition
+         - Write endpoints
+         - Read endpoints
+       * - No active lock held on the ECU
+         - Rejected -- HTTP 409
+         - Allowed
+       * - Caller owns an active non-exclusive lock
+         - Allowed
+         - Allowed
+       * - Non-exclusive lock held by another client
+         - Rejected -- HTTP 423
+         - Allowed
+       * - Caller owns an active exclusive lock
+         - Allowed
+         - Allowed
+       * - Exclusive lock held by another client
+         - Rejected -- HTTP 423
+         - Rejected -- HTTP 423
+       * - Caller holds the vehicle/functional/ecu lock
+         - Allowed
+         - Allowed
+       * - Caller holds a defunct lock for this ECU
+         - Rejected -- HTTP 409
+         - Rejected -- HTTP 409
+
+    **Write endpoints**: ``PUT /data/{id}``, ``PUT /configurations/{id}``,
+    ``POST /operations/{op}/executions``, ``GET /operations/{op}/executions/{id}``,
+    ``DELETE /operations/{op}/executions/{id}``, ``PUT /modes/*``,
+    ``DELETE /faults``, ``DELETE /faults/{dtc}``, ``POST /genericservice``,
+    download endpoints.
+
+    **Read endpoints**: ``GET /data/{id}``, ``GET /configurations/{id}``,
+    ``GET /faults``, ``GET /faults/{dtc}``.
+
+    **Error Messages**
+
+    Errors shall follow the standard SOVD error pattern. In case a lock was preempted,
+    the error code ``lock-broken`` must be used, with an additional ``parameters`` field,
+    including the properties ``broken_by```, ``broken_at`` and ``current_holder``.
+
+    When a resource is accessed, which requires a lock, or is currently locked by a different
+    client, the error code ``vendor-code`` shall be used, with the ``vendor_code`` indicating
+    the exact reason. A lock error enum shall be used for all lock related errors, which by
+    default will be outputted as vendor specific errors, with the enum value as the vendor code.
+
+    **Rationale**
+
+    Requiring a lock for write operations prevents concurrent modification of ECU state.
+    Allowing reads without a lock when no exclusive lock is held supports monitoring
+    clients that do not need to coordinate with active diagnostic sessions.
+
+    Exclusive locks are required on critical ECU operations like flashing, when a stray
+    read operation can cause failures.
+
+
+.. req:: Functional Group Lock Endpoint Enforcement
+    :id: req~sovd-api-lock-fg-enforcement
+    :links: arch~sovd-api-lock-fg-enforcement
+    :status: draft
+
+    The same enforcement rules defined in :need:`req~sovd-api-lock-ecu-enforcement` apply
+    to requests targeting a functional group's communication endpoints:
+    ``/functions/functionalgroups/{group-name}/data``,
+    ``/functions/functionalgroups/{group-name}/operations``, and
+    ``/functions/functionalgroups/{group-name}/modes``.
+
+
+.. req:: Lock Requirement Policy
+    :id: req~sovd-api-lock-requirement-policy
+    :links: arch~sovd-api-lock-requirement-policy
+    :status: draft
+
+    The CDA must support a configurable option, ``lock_requirement_policy``, that
+    determines which categories of requests require an active lock on the target entity.
+    This option is modeled as an enumeration to allow additional requirement policies to be
+    introduced in the future without renaming or restructuring the configuration option.
+
+    The following values must be supported:
+
+    .. list-table:: ``lock_requirement_policy`` values
+       :header-rows: 1
+       :widths: 25 75
+
+       * - Value
+         - Behavior
+       * - ``require_for_write_operations`` (default)
+         - A lock is required only for write endpoints, as defined in the enforcement
+           tables of :need:`req~sovd-api-lock-ecu-enforcement` and
+           :need:`req~sovd-api-lock-fg-enforcement`. Read endpoints remain accessible when
+           no active lock is held on the entity.
+       * - ``require_for_all_operations``
+         - A lock is required for both write and read endpoints. The "No active lock held
+           on the ECU" / "No active lock held on the functional group" row of the
+           enforcement tables in :need:`req~sovd-api-lock-ecu-enforcement` and
+           :need:`req~sovd-api-lock-fg-enforcement` applies to read endpoints as well: such
+           requests must be rejected with **HTTP 409 (Conflict)**. All other rows of those
+           enforcement tables, and all other lock behavior (exclusivity, defunct locks,
+           vehicle lock equivalence), apply identically regardless of the selected value.
+
+    This option applies uniformly to both ECU-scoped and functional-group-scoped
+    communication endpoints.
+
+    **Rationale**
+
+    Some deployments require every diagnostic interaction with an ECU or functional group --
+    including read-only monitoring requests -- to be attributable to an active, identifiable
+    lock owner, for example to satisfy audit or safety-case requirements. Other deployments
+    want unlocked reads to remain possible for monitoring or logging clients. Modeling the
+    option as an enumeration keeps the configuration surface future-proof for additional
+    requirement policies without introducing further boolean flags.
+
+
+.. req:: Lock Acquisition Policy
+    :id: req~sovd-api-lock-acquisition-policy
+    :links: arch~sovd-api-lock-acquisition-policy
+    :status: draft
+
+    The CDA must support a configurable option, ``lock_acquisition_policy``, controlling
+    whether a vehicle lock must already exist before an ECU or functional group lock may be
+    acquired. This option is modeled as an enumeration to allow additional acquisition
+    policies to be introduced in the future without renaming or restructuring the
+    configuration option.
+
+    The following values must be supported:
+
+    .. list-table:: ``lock_acquisition_policy`` values
+       :header-rows: 1
+       :widths: 25 75
+
+       * - Value
+         - Behavior
+       * - ``unrestricted`` (default)
+         - ECU and functional group locks may be acquired independently of whether a vehicle
+           lock exists.
+       * - ``vehicle_lock_required``
+         - An ECU or functional group lock POST request must be rejected with
+           **HTTP 409 (Conflict)** unless an active vehicle lock currently exists, regardless
+           of the identity of the requesting client or the vehicle lock's owner.
+
+    This requirement is independent of, and must not be confused with,
+    :need:`req~sovd-api-lock-vehicle-blocking`: that requirement governs what happens to
+    *other* clients while a vehicle lock is held (blocking their acquisition of child
+    locks), whereas ``lock_acquisition_policy: vehicle_lock_required`` governs whether a
+    vehicle lock must exist *at all*, for any client including the one requesting the child
+    lock, before a child lock acquisition may proceed.
+
+    **Rationale**
+
+    Some deployments require all ECU- and functional-group-level diagnostic locking to occur
+    strictly within the scope of an overarching vehicle-level claim, ensuring no diagnostic
+    entity can be locked in isolation without an active vehicle-wide session already having
+    been established. Modeling the option as an enumeration keeps the configuration surface
+    future-proof for additional acquisition policies (e.g. hierarchical or vendor-specific
+    schemes) without introducing further boolean flags.
+
+
+.. req:: Vehicle Lock Blocks Child Lock Acquisition
+    :id: req~sovd-api-lock-vehicle-blocking
+    :links: arch~sovd-api-lock-vehicle-blocking
+    :status: draft
+
+    When a vehicle lock is held by a client, any other clients attempt to acquire an ECU
+    lock or a functional group lock must be rejected with HTTP 409.
+
+    The vehicle lock owner may still acquire ECU or functional group locks.
+
+    **Rationale**
+
+    The vehicle lock represents a claim over the complete set of diagnostic entities on the
+    vehicle. Permitting other clients to acquire child locks while the vehicle lock is held
+    would violate that claim.
+
+
+.. req:: Lock Priority Preemption
+    :id: req~sovd-api-lock-priority
+    :links: arch~sovd-api-lock-priority
+    :status: draft
+
+    The CDA must support a vendor-configurable lock preemption mechanism applicable to vehicle locks.
+
+    A lock POST request may include additional fields in the request body, these can be used
+    by a vendor specific implementation to allow lock overrides.
+
+    The vendor mechanism shall verify its additional fields before every lock POST request is
+    processed, independently of lock scope and whether another lock is currently held. The CDA
+    shall keep these fields opaque apart from generic transport and resource limits.
+
+    Note, the vendor specific implementation must be aware of the current lock holders additional fields,
+    since they can impact the priority decision.
+
+    The mechanism retrieves:
+    - the requesting client's JWT claims,
+    - the additional values from the request body, and
+    - the identity of the current lock holder and additional metadata.
+
+    The mechanism returns:
+
+    - whether the requesting client has sufficient priority to preempt the current holder,
+      and
+    - the identity string of the requesting client to be recorded as
+      ``broken_by`` in the defunct lock.
+
+    If the mechanism grants preemption, the existing lock transitions to a defunct state
+    (see :need:`req~sovd-api-lock-defunct`) and the requesting client immediately acquires
+    the lock.
+
+    If no vendor mechanism is configured, or if the mechanism does not grant preemption,
+    conflicting POST requests are rejected with HTTP 423. An explicit vendor-policy denial
+    includes ``vendor_code: lock-priority-denied``.
+
+    **Rationale**
+
+    In multi-client environments certain clients (e.g. OEM tooling, safety-critical
+    services) require guaranteed access to diagnostic entities for specific use-cases, even when
+    another client holds the lock. Delegating the preemption decision to a vendor mechanism
+    allows vendors to implement any priority scheme without modifying the CDA core.
+
+
+.. req:: Defunct Lock State
+    :id: req~sovd-api-lock-defunct
+    :links: arch~sovd-api-lock-defunct
+    :status: draft
+
+    When a lock is preempted by a higher-priority client it must transition to a
+    **defunct** state. The following rules apply:
+
+    - Cleanup (Tester Present stop, ECU session and security access reset) is executed
+      at preemption time, unless a functional group lock of the same client still covers
+      the ECU (see :need:`req~uds-tester-present`), in which case no cleanup is executed.
+    - The defunct lock must remain visible in ``GET /locks`` until its original expiration
+      time elapses, or it is deleted.
+    - The defunct lock response must include the standard lock fields (``id``, ``owned``,
+      ``lock_expiration``) together with the following vendor-prefixed extension fields:
+
+      - ``x-sovd2uds-broken-by`` -- the identity of the preempting client, as returned
+        by the vendor mechanism.
+      - ``x-sovd2uds-broken-at`` -- the ISO 8601 timestamp at which preemption occurred.
+      - ``x-sovd2uds-current-holder`` -- identity of the current lock holder
+    - When the defunct lock's original expiration elapses it is silently removed; no
+      cleanup is triggered.
+    - When the defunct lock is deleted, no cleanup is triggered.
+    - The new (higher-priority) lock operates normally and performs its own cleanup on
+      release or expiry.
+
+    **Rationale**
+
+    Retaining the defunct lock gives the preempted client an observable signal that their
+    lock was superseded, identifying who took it and when, and if a lock is still held.
+
+
+
+.. req:: HTTP 409 for Preempted Clients
+    :id: req~sovd-api-lock-defunct-enforcement
+    :links: arch~sovd-api-lock-defunct-enforcement
+    :status: draft
+
+    When a client whose lock has been made defunct attempts to call any ECU communication
+    endpoint, the CDA must return **HTTP 409 (Conflict)**.
+
+    HTTP 409 applies to all communication endpoints (e.g. data, configurations, operations,
+    modes, faults, genericservice, x-sovd2uds-download). It does not apply to the ``/locks``
+    sub-resource itself.
+
+    **Rationale**
+
+    HTTP 409 distinguishes preemption from other failures, giving the preempted client an actionable signal
+    that a higher-priority client has taken over the diagnostic entity.
+
+    This is also the reason for the error being applied to all read communications, even if the higher
+    prioritized lock is non-exclusive.
+
+
+.. _requirements_sovd_api_functional_communication:
+
+Functional communication
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. req:: Functional Communication
+    :id: req~sovd-api-functional-communication
+    :links: arch~sovd-api-functional-communication-dd-configuration
+    :status: draft
+
+    Functional communications needs to be possible. A standardized resource collection must be made available within the
+    ``/functions/functionalgroups/{groupName}`` resource.
+
+    The available functionality must be defined in an additional diagnostic description used solely for defining
+    functional communication services. Since this file may contain multiple logical link definitions, a configuration
+    option can be provided to filter the available links.
+
+    The following entities must be available in the functional groups resource collection:
+
+    .. list-table:: Functional groups entities
+       :header-rows: 1
+       :widths: 30 70
+
+       * - Entity
+         - Function
+       * - locks
+         - Locking a functional group (also controls functional tester present)
+       * - operations
+         - Calling functional routines
+       * - data
+         - Calling functional data services
+       * - modes
+         - Setting modes for the ecus in the functional group
+
+    **Rationale**
+
+    Clients require functional communication to ECUs for use-cases, in which they want to control communication or dtcsettings for all ecus.
+
+.. _requirements_sovd_api_flash_api:
+
+Flash API
+^^^^^^^^^
+
+.. req:: Flash API
+    :id: req~sovd-api-flashing
+    :links: arch~sovd-api-flash-file-management, arch~sovd-api-flash-data-transfer
+    :status: draft
+
+    A Flash-API is required to support flashing of ECUs, utilizing SIDs 34\ :sub:`16`, 36\ :sub:`16` & 37\ :sub:`16`. It needs to enable efficient transfer of the data, without sending the individual data transfers via REST.
+
+    Flashing is the process of updating the firmware of an ECU.
+
+    **Rationale**
+
+    Handling for the aforementioned SIDs isn't defined in the ISO specification, it is however an important use-case to be able to update the firmware on ECUs.
+
+.. req:: Flash API - Data Source Restriction
+    :id: req~sovd-api-flashing-security
+    :status: draft
+
+    The source of the data to be sent for flashing, must be restrictable to a path and its subdirectories via configuration.
+
+    **Rationale**
+
+    Without restrictions to the path, an attacker could exfiltrate arbitrary accessible data.
+
+Communication Parameters API
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. req:: Communication Parameters API
+    :id: req~sovd-api-comparams
+    :links: arch~sovd-api-comparams
+    :status: draft
+
+    An API to retrieve and modify communication parameters must be provided
+
+    **Rationale**
+
+    Clients need the ability to modify communication parameters on-the-fly to communicate with classic ECUs.
+
+MDD Embedded files
+^^^^^^^^^^^^^^^^^^
+
+.. req:: MDD Embedded files
+    :id: req~sovd-api-mdd-embedded-files
+    :links: arch~sovd-api-mdd-embedded-files
+    :status: draft
+
+    The CDA must support reading embedded files from the MDD file, and provide them via the
+    ``/components/{ecuName}/x-sovd2uds-bulk-data/mdd-embedded-files`` endpoint (listing) and
+    ``/components/{ecuName}/x-sovd2uds-bulk-data/mdd-embedded-files/{id}`` endpoint (retrieval).
+
+    **Rationale**
+
+    Some data required for communication with ECUs might be embedded in the mdd file. To allow clients to retrieve this data, it must be made available through the API.
+
+Security
+^^^^^^^^
+
+Since vendors have different requirements and systems regarding security, security related functionality has to be
+implemented in a plugin, see :ref:`requirements-plugins-security`.
+
+Token validation
+""""""""""""""""
+
+.. todo:: define delegated responsibility to security plugin for checking the token and extracting/using the data
+
+Audiences
+"""""""""
+
+.. todo:: define audiences, delegated responsibility to security plugin
+
+Session States
+""""""""""""""
+
+.. todo:: define transitions, preconditions, and how they work/are checked
+
+
+OpenAPI-Documentation
+---------------------
+
+.. req:: OpenAPI Documentation
+    :id: req~sovd-api-openapi-documentation
+    :status: draft
+
+    An OpenAPI documentation of the provided API must be available for every endpoint of the CDA when ``/docs`` is appended.
+
+    **Rationale**
+
+    Required by the standard.
+
+
+.. req:: OpenAPI Schema
+    :id: req~sovd-api-openapi-schema
+    :status: draft
+
+    An OpenAPI schema description of the retrieved data must be included in the response when the query
+    parameter ``include-schema=true`` is appended to any endpoint with returned data.
+
+    **Rationale**
+
+    Required by the standard.

@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: 2026 Copyright (c) Contributors to the Eclipse Foundation
+#
+# See the NOTICE file(s) distributed with this work for additional
+# information regarding copyright ownership.
+#
+# This program and the accompanying materials are made available under the
+# terms of the Apache License Version 2.0 which is available at
+# https://www.apache.org/licenses/LICENSE-2.0
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Post PR comments from artifacts produced by PR workflows.
+# This workflow_run trigger runs in the context of the base repository, so
+# it has write permissions even when the PR originates from a fork.
+
+name: Post PR Comments
+
+on:
+  workflow_run:
+    workflows: ["Rust CI", "Duplicate Code Check"]
+    types: [completed]
+
+jobs:
+  post:
+    if: github.event.workflow_run.event == 'pull_request'
+    uses: eclipse-opensovd/cicd-workflows/.github/workflows/post-pr-comments.yml@febc566231f4ff6fafec78c91078e381666120f9
+    with:
+      run-id: ${{ github.event.workflow_run.id }}
+      comment-artifacts: >-
+        ${{ github.event.workflow_run.name == 'Duplicate Code Check'
+          && 'pr-comment-duplicate-code'
+          || 'pr-comment-coverage pr-comment-crap' }}
+    permissions:
+      actions: read
+      pull-requests: write

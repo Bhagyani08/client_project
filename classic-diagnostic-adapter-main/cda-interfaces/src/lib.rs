@@ -1,0 +1,452 @@
+/*
+ * SPDX-FileCopyrightText: 2025 Copyright (c) Contributors to the Eclipse Foundation
+ *
+ * See the NOTICE file(s) distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Apache License Version 2.0 which is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+use std::{
+    fmt::{Display, Formatter},
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use futures::{FutureExt, future::BoxFuture};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+mod can_id;
+pub use can_id::*;
+mod com_param_handling;
+pub use com_param_handling::*;
+pub mod datatypes;
+pub mod diagservices;
+mod ecugateway;
+pub use ecugateway::{
+    EcuGateway, FunctionalTransport, NetworkTopology, PhysicalTransport, RouteStatus,
+    TransmissionParameters, TransportProbe,
+};
+mod ecumanager;
+pub use ecumanager::*;
+mod ecuuds;
+pub use ecuuds::*;
+pub mod file_manager;
+pub mod health;
+pub mod http_protection;
+pub mod lock_config;
+pub mod lock_priority_api;
+mod schema;
+pub use schema::*;
+pub mod communication_control;
+pub mod component_slot;
+pub mod config;
+pub mod runtime_update_api;
+pub mod storage_api;
+mod transport;
+pub use transport::TransportType;
+pub mod uds;
+pub use uds::{
+    DEFAULT_SUBFUNCTION_MASK, PendingNrc, SERVICE_IDS_PARAMETER_META_DATA,
+    SUPPRESS_POSITIVE_RESPONSE_BIT, TransportResponse, UDS_ID_RESPONSE_BITMASK,
+    is_negative_response, is_pending_nrc, is_tester_present_nrc, nrc, pending_nrc_from_raw,
+    service_ids, subfunction_ids, uds_response_from_raw,
+};
+
+// Deliberately not using new type pattern here, to make sure all crates that take
+// std::collection::Hash* still work.
+// Together with the foldhash hasher, this is virtually the same as using hashbrown.
+pub type Hasher = foldhash::fast::RandomState;
+pub type HashMap<K, V> = std::collections::HashMap<K, V, Hasher>;
+pub type HashMapEntry<'a, K, V> = std::collections::hash_map::Entry<'a, K, V>;
+
+pub type HashSet<V> = std::collections::HashSet<V, Hasher>;
+// Note: hash_set_entry is unstable, hence not defining it.
+
+pub use foldhash::{HashMapExt as HashMapExtensions, HashSetExt as HashSetExtensions};
+
+/// # strings module
+/// This module contains a type that allows to store unique strings and use references to them
+/// instead of cloning the strings themselves in all places.<br>
+/// This is to optimize the memory usage of the diagnostic databases, as they contain a lot of
+/// strings which are often not unique.<br>
+/// The module additionally contains macros to handle string IDs and references in the diagnostic
+/// database.
+pub(crate) mod strings;
+/// Re-export the STRINGS macros to make it available in the crate scope.
+pub use strings::*;
+pub mod util;
+
+pub type DynamicPlugin = Box<dyn std::any::Any + Send + Sync>;
+
+/// ECU names for which variant detection should be triggered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariantDetectionRequest(Vec<String>);
+
+impl VariantDetectionRequest {
+    #[must_use]
+    pub fn new(ecus: Vec<String>) -> Self {
+        Self(ecus)
+    }
+
+    #[must_use]
+    pub fn into_ecus(self) -> Vec<String> {
+        self.0
+    }
+}
+
+/// Sends requests to the variant-detection listener.
+#[derive(Debug, Clone)]
+pub struct VariantDetectionSender(tokio::sync::mpsc::Sender<VariantDetectionRequest>);
+
+impl VariantDetectionSender {
+    #[must_use]
+    pub fn new(sender: tokio::sync::mpsc::Sender<VariantDetectionRequest>) -> Self {
+        Self(sender)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if the variant-detection receiver has been closed.
+    pub async fn send(
+        &self,
+        request: VariantDetectionRequest,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<VariantDetectionRequest>> {
+        self.0.send(request).await
+    }
+}
+
+/// Receives requests for the variant-detection listener.
+#[derive(Debug)]
+pub struct VariantDetectionReceiver(tokio::sync::mpsc::Receiver<VariantDetectionRequest>);
+
+impl VariantDetectionReceiver {
+    #[must_use]
+    pub fn new(receiver: tokio::sync::mpsc::Receiver<VariantDetectionRequest>) -> Self {
+        Self(receiver)
+    }
+
+    pub async fn recv(&mut self) -> Option<VariantDetectionRequest> {
+        self.0.recv().await
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if no request is currently available or all senders have been dropped.
+    pub fn try_recv(
+        &mut self,
+    ) -> Result<VariantDetectionRequest, tokio::sync::mpsc::error::TryRecvError> {
+        self.0.try_recv()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum DiagCommAction {
+    Read,
+    Write,
+    Start,
+    RequestResults,
+    Stop,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiagComm {
+    pub name: String,
+    pub type_: DiagCommType,
+    pub lookup_name: Option<String>,
+    pub subfunction_id: Option<u8>,
+}
+
+impl DiagComm {
+    #[must_use]
+    pub fn new(name: impl Into<String>, type_: DiagCommType) -> Self {
+        let name = name.into();
+        Self {
+            lookup_name: Some(name.clone()),
+            name,
+            type_,
+            subfunction_id: None,
+        }
+    }
+
+    #[must_use]
+    pub fn action(&self) -> DiagCommAction {
+        self.type_.clone().into()
+    }
+}
+
+impl From<DiagCommType> for DiagCommAction {
+    fn from(value: DiagCommType) -> Self {
+        match value {
+            DiagCommType::Configurations => DiagCommAction::Write,
+            DiagCommType::Data => DiagCommAction::Read,
+            // Faults is actually Clear or Read, but doesn't matter here
+            DiagCommType::Faults | DiagCommType::Modes | DiagCommType::Operations => {
+                DiagCommAction::Start
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// Enum representing diagnostic communication types according to ASAM SOVD.
+///
+/// Can be mapped to UDS service prefixes with [`DiagCommType::service_prefixes`]
+pub enum DiagCommType {
+    /// Service Prefix `0x2E`
+    Configurations,
+    /// Service Prefixes `0x21` (KWP2000), `0x22` (UDS)
+    Data,
+    /// Service Prefixes `0x14`, `0x19`
+    Faults,
+    /// Service Prefixes `0x10`, `0x11`, `0x28`, `0x85`, `0x27`, `0x29`
+    Modes,
+    /// Service Prefixes `0x2F`, `0x31`, `0x34`, `0x36`, `0x37`
+    Operations,
+}
+
+impl TryFrom<u8> for DiagCommType {
+    type Error = DiagServiceError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            service_ids::WRITE_DATA_BY_IDENTIFIER => Ok(DiagCommType::Configurations),
+            service_ids::READ_DATA_BY_LOCAL_IDENTIFIER | service_ids::READ_DATA_BY_IDENTIFIER => {
+                Ok(DiagCommType::Data)
+            }
+            service_ids::CLEAR_DIAGNOSTIC_INFORMATION | service_ids::READ_DTC_INFORMATION => {
+                Ok(DiagCommType::Faults)
+            }
+            service_ids::SESSION_CONTROL
+            | service_ids::ECU_RESET
+            | service_ids::SECURITY_ACCESS
+            | service_ids::COMMUNICATION_CONTROL
+            | service_ids::AUTHENTICATION
+            | service_ids::CONTROL_DTC_SETTING => Ok(DiagCommType::Modes),
+            service_ids::INPUT_OUTPUT_CONTROL_BY_IDENTIFIER
+            | service_ids::ROUTINE_CONTROL
+            | service_ids::REQUEST_DOWNLOAD
+            | service_ids::TRANSFER_DATA
+            | service_ids::REQUEST_TRANSFER_EXIT => Ok(DiagCommType::Operations),
+            _ => Err(DiagServiceError::InvalidRequest(format!(
+                "Invalid DiagCommType value: {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum SecurityAccess {
+    RequestSeed(DiagComm),
+    SendKey(DiagComm),
+}
+
+#[derive(Clone, Debug)]
+pub enum TesterPresentMode {
+    Start,
+    Stop,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum TesterPresentType {
+    Functional(String),
+    Ecu(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct TesterPresentControlMessage {
+    pub mode: TesterPresentMode,
+    pub type_: TesterPresentType,
+    pub ecu: String,
+    /// If set to `None`, the ECU specific interval will be used.
+    pub interval: Option<Duration>,
+}
+
+impl TesterPresentType {
+    #[must_use]
+    pub fn is_functional(&self) -> bool {
+        matches!(self, TesterPresentType::Functional(_))
+    }
+}
+
+impl DiagCommType {
+    #[must_use]
+    /// This function returns the service prefix for the given `DiagCommType`
+    /// according to ASAM_SOVD_BS_V1-0-0
+    /// # Service Prefixes Mapping
+    ///  - `0x2E` -> `<entity>/configurations`
+    ///  - `0x22` -> `<entity>/data`
+    ///  - `0x10` -> `<entity>/modes/session`
+    ///  - `0x11` -> `<entity>/modes/ecureset`
+    ///  - `0x28` -> `<entity>/modes/commctrl`
+    ///  - `0x85` -> `<entity>/modes/dtcsetting`
+    ///  - `0x27 | 0x29` -> `<entity>/modes/security`
+    ///  - `0x14 | 0x19` -> `<entity>/faults`
+    ///  - `0x2F | 0x31` -> `<entity>/operations`
+    pub fn service_prefixes(&self) -> &'static [u8] {
+        use crate::uds::{
+            CONFIGURATIONS_PREFIXES, DATA_PREFIXES, FAULTS_PREFIXES, MODES_PREFIXES,
+            OPERATIONS_PREFIXES,
+        };
+        match self {
+            DiagCommType::Configurations => &CONFIGURATIONS_PREFIXES,
+            DiagCommType::Data => &DATA_PREFIXES,
+            DiagCommType::Faults => &FAULTS_PREFIXES,
+            DiagCommType::Modes => &MODES_PREFIXES,
+            DiagCommType::Operations => &OPERATIONS_PREFIXES,
+        }
+    }
+}
+
+/// Functional group description and lookup configuration.
+#[derive(Deserialize, Serialize, Clone, Debug, schemars::JsonSchema)]
+pub struct FunctionalDescriptionConfig {
+    /// Name of the database containing functional group definitions.
+    pub description_database: String,
+    /// Optional set of functional group names to enable.
+    /// When absent, all functional groups are enabled.
+    pub enabled_functional_groups: Option<HashSet<String>>,
+    /// Position of the protocol identifier in service names.
+    pub protocol_position: datatypes::DiagnosticServiceAffixPosition,
+}
+impl Default for FunctionalDescriptionConfig {
+    fn default() -> Self {
+        Self {
+            description_database: "functional_groups".to_owned(),
+            enabled_functional_groups: None,
+            protocol_position: datatypes::DiagnosticServiceAffixPosition::Suffix,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum DiagServiceError {
+    /// Returned in case a resource can not be found
+    #[error("Not found: {0:?}")]
+    NotFound(String),
+    #[error("Request not supported: {0}")]
+    RequestNotSupported(String),
+    #[error("Communication disabled: {0}")]
+    CommunicationDisabled(String),
+    /// Communication was not enabled and either activation is not authorized
+    /// under the current `init_mode` or activation itself failed. Carries a
+    /// configured retry hint, unlike the coarser [`CommunicationDisabled`](Self::CommunicationDisabled).
+    #[error("Communication not ready: {message}")]
+    CommunicationNotReady {
+        message: String,
+        retry_after: Duration,
+    },
+    #[error("Invalid database: {0}")]
+    InvalidDatabase(String),
+    #[error("Invalid request: {0}")]
+    InvalidRequest(String),
+    #[error("Parameter conversion error: {0}")]
+    ParameterConversionError(String),
+    #[error("Unknown operation")]
+    UnknownOperation,
+    #[error("UDS lookup error: {0}")]
+    UdsLookupError(String),
+    #[error("Bad payload: {0}")]
+    BadPayload(String),
+    /// Similar to `BadPayload` but indicates that the data received is insufficient to
+    /// process the request.
+    /// Used to abort reading data gracefully when the data is incomplete or end of pdu is reached.
+    #[error("Payload too short, expected at least {expected} bytes, got {actual} bytes")]
+    NotEnoughData { expected: usize, actual: usize },
+    #[error("Variant detection error: {0}")]
+    VariantDetectionError(String),
+    #[error("{0}")]
+    InvalidState(String),
+    #[error("{0}")]
+    InvalidAddress(String),
+    #[error("Sending message failed {0}")]
+    SendFailed(String),
+    #[error("Received Nack, code={0:?}")]
+    Nack(u8),
+    #[error("Unexpected response. {0:?}")]
+    UnexpectedResponse(Option<String>),
+    #[error("No response {0}")]
+    NoResponse(String),
+    #[error("Connection closed {0}")]
+    ConnectionClosed(String),
+    #[error("Ecu {0} offline")]
+    EcuOffline(String),
+    #[error("Timeout")]
+    Timeout,
+    #[error("Access denied: {0}")]
+    AccessDenied(String),
+    /// Returned in case a resource can be found but returns an error
+    #[error("Resource error: {0}")]
+    ResourceError(String),
+    #[error("Data parse error: value='{}', details='{}'", .0.value, .0.details)]
+    DataError(DataParseError),
+    /// Returned in case the provided value for security plugin cannot be used as `SecurityApi`
+    #[error("Invalid security plugin provided")]
+    InvalidSecurityPlugin,
+    #[error(
+        "Unable to find a unique value with the given parameters: name='{name}', \
+         candidates='{candidates:?}'"
+    )]
+    AmbiguousParameters {
+        name: String,
+        candidates: Vec<String>,
+    },
+    #[error("No value found with the given parameters. Possible values are: {possible_values:?}")]
+    InvalidParameter { possible_values: HashSet<String> },
+    #[error("Invalid configuration: {0}")]
+    InvalidConfiguration(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataParseError {
+    pub value: String,
+    pub details: String,
+}
+
+impl std::fmt::Display for DiagComm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "DiagService ( name: {}, operation: {:?} )",
+            self.name,
+            self.action()
+        )
+    }
+}
+
+impl Display for DiagCommAction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiagCommAction::Read => write!(f, "Read"),
+            DiagCommAction::Write => write!(f, "Write"),
+            DiagCommAction::Start => write!(f, "Start"),
+            DiagCommAction::RequestResults => write!(f, "RequestResults"),
+            DiagCommAction::Stop => write!(f, "Stop"),
+        }
+    }
+}
+
+/// Type alias for the boxed shared shutdown signal.
+/// This provides a concrete named type for use in generic bounds.
+pub type ShutdownSignal = futures::future::Shared<BoxFuture<'static, ()>>;
+
+pub fn shutdown_signal<F>(future: F) -> ShutdownSignal
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    future.boxed().shared()
+}
+
+/// Capability for gracefully shutting down background tasks/connections, e.g. before a
+/// hot-reload replaces the underlying component with a freshly constructed one.
+#[async_trait]
+pub trait Shutdown: Send + Sync + 'static {
+    /// Aborts background tasks and releases connections/resources owned by this instance.
+    /// Implementations should be idempotent where practical.
+    async fn shutdown(&self);
+}

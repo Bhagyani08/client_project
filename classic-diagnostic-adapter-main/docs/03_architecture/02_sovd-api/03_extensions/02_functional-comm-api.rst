@@ -1,0 +1,107 @@
+.. SPDX-FileCopyrightText: 2025 Copyright (c) Contributors to the Eclipse Foundation
+..
+.. See the NOTICE file(s) distributed with this work for additional
+.. information regarding copyright ownership.
+..
+.. This program and the accompanying materials are made available under the
+.. terms of the Apache License Version 2.0 which is available at
+.. https://www.apache.org/licenses/LICENSE-2.0
+..
+.. SPDX-License-Identifier: Apache-2.0
+
+.. _architecture_functional_communication:
+
+Functional communication
+------------------------
+
+.. arch:: Diagnostic description & Configuration
+    :id: arch~sovd-api-functional-communication-dd-configuration
+    :status: draft
+
+    Information about the available functional groups, the available services in those groups, and their communication parameters must be provided in a separate diagnostic description.
+
+    The diagnostic description's MDD filename, in which the information for functional communication is contained, must be configurable. When no file is configured, functional communication is not available.
+
+    A configuration option in the CDA can further filter the available functional groups from the diagnostic description.
+
+    **Rationale**
+
+    Extracting a standardized resource collection for functional communication from individual ECU descriptions is challenging and non-transparent when extracting common functional services from all ECU files. Therefore, we chose to do this via a separate diagnostic description file.
+
+    This also follows the general pattern of one MDD file to an available standardized resource collection.
+
+API
+^^^
+
+.. arch:: Functional Communication API
+    :id: arch~sovd-api-functional-communication-api
+    :links: arch~sovd-api-functional-communication-locks, arch~sovd-api-functional-communication-data, arch~sovd-api-functional-communication-operations, arch~sovd-api-functional-communication-modes
+    :status: draft
+
+    Functional group functionality - if available - must be available in the ``/functions/functionalgroups/{group-name}`` path.
+
+    Within that path, a standardized resource collection (chapter 5.4.2 in ISO/DIS 17978-3) must be available, with the linked semantics.
+
+    .. uml:: /03_architecture/02_sovd-api/03_extensions/images/functional_comm_api.puml
+
+
+.. arch:: Functional Communication ECU-Lock behavior
+    :id: arch~sovd-api-functional-communication-locks
+    :status: draft
+
+    Locking a functional group will start sending functional Tester Presents to the functional DoIP addresses of all DoIP Entities, and stop sending non-functional Tester Presents.
+
+    **Component Lock Takeover**
+
+    For every ECU covered by the functional group on which the same client already holds a component (ECU) lock, that component lock's physical Tester Present is stopped once the functional group lock's acquisition commits. The component lock itself is not released: it remains valid and renewable on its own, but it no longer runs its own Tester Present or responds independently to release; the functional group lock now owns both.
+
+    Releasing, expiring, or preempting the functional group lock also releases every component lock it replaced the Tester Present of, running each one's own cleanup (Tester Present stop, session and security access reset) as well as its own. Releasing or expiring one of those component locks on its own, while the functional group lock still covers that ECU, runs no cleanup at all; the functional group lock still owns the ECU until it is itself released.
+
+    A component lock acquired while the same client already holds a functional group lock covering that ECU starts no physical Tester Present of its own, for the same reason.
+
+    .. uml:: /03_architecture/02_sovd-api/03_extensions/images/functional_comm_locks.puml
+
+
+.. arch:: Functional Communication - Data
+    :id: arch~sovd-api-functional-communication-data
+    :status: draft
+
+    **Data**
+
+    Since functional communication returns data from multiple ECUs, the ``/data/{data-identifier}`` endpoint must return, within the top level of ``data``, the name of the ECU as the key, and only then its returned data (if any) as the value.
+
+    In case of errors, the ``errors`` structures must still return the type ``DataError[]``. Inside a ``DataError``, the JSON pointer must always point to the ``data/{ecu-name}/...`` element (including the ECU name), or, in case of communication/timeout errors, just to the ECU entry ``/data/{ecu-name}``. A regular GenericError response with a failing HTTP status code (4xx, 5xx) is only acceptable when no communication was performed and the request failed beforehand.
+
+    .. note::
+       The content-type ``application/octet-stream`` is only supported for requests.
+
+    .. uml:: /03_architecture/02_sovd-api/03_extensions/images/functional_comm_data.puml
+
+
+.. arch:: Functional Communication - Operations
+    :id: arch~sovd-api-functional-communication-operations
+    :status: draft
+
+    Same principle as with data, except that the top-level element name is ``parameters``.
+    Asynchronous ``Start`` responses return HTTP status ``202 ACCEPTED`` with ECU-keyed
+    ``parameters`` and any per-ECU conversion failures in ``errors``. Error paths point to
+    ``/parameters/{ecu-name}/{field}``, or ``/parameters/{ecu-name}`` if the complete response from
+    an ECU cannot be decoded.
+
+    .. note::
+       The content-type ``application/octet-stream`` is only supported for requests.
+
+    .. uml:: /03_architecture/02_sovd-api/03_extensions/images/functional_comm_operations.puml
+
+
+.. arch:: Functional Communication - Modes
+    :id: arch~sovd-api-functional-communication-modes
+    :status: draft
+
+    The following modes must be supported for functional groups when the underlying diagnostic description contains them:
+
+     1. session
+     2. dtcsetting
+     3. commctrl
+
+    .. uml:: /03_architecture/02_sovd-api/03_extensions/images/functional_comm_modes.puml

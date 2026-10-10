@@ -1,0 +1,55 @@
+' SPDX-FileCopyrightText: 2026 Copyright (c) Contributors to the Eclipse Foundation
+'
+' See the NOTICE file(s) distributed with this work for additional
+' information regarding copyright ownership.
+'
+' This program and the accompanying materials are made available under the
+' terms of the Apache License Version 2.0 which is available at
+' https://www.apache.org/licenses/LICENSE-2.0
+'
+' SPDX-License-Identifier: Apache-2.0
+
+@startuml
+title Generic Service -- Raw UDS Passthrough
+
+participant Client
+participant CDA
+participant "Security\nPlugin" as SEC
+participant "Diagnostic\nKernel" as DIAG
+participant "UDS / DoIP" as COMM
+participant ECU
+
+Client -> CDA : PUT /components/{ecu}/genericservice\nContent-Type: application/octet-stream\nAccept: application/octet-stream\nRaw bytes: 22 F1 90
+activate CDA
+
+CDA -> DIAG : send raw UDS (byte array)
+activate DIAG
+
+DIAG -> DIAG : read SID from first byte (22)\nresolve matching MDD service
+
+note over DIAG : Remaining request bytes are not\nparameter-decoded or validated
+
+DIAG -> DIAG : check service preconditions
+
+DIAG -> SEC : validate resolved diagnostic service
+activate SEC
+SEC -> SEC : evaluate authorization for service
+SEC --> DIAG : authorized
+deactivate SEC
+
+DIAG -> COMM : send raw UDS request
+activate COMM
+COMM -> ECU : DoIP -> raw UDS\n(22 F1 90)
+activate ECU
+ECU -> COMM : raw UDS response\n(62 F1 90 {data})
+deactivate ECU
+COMM -> DIAG : raw UDS response bytes
+deactivate COMM
+
+DIAG -> CDA : raw response bytes
+deactivate DIAG
+
+CDA -> Client : HTTP 200 OK\nContent-Type: application/octet-stream\nRaw bytes: 62 F1 90 {data}
+deactivate CDA
+
+@enduml

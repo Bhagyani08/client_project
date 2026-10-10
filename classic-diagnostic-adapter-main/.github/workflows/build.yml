@@ -1,0 +1,518 @@
+# SPDX-FileCopyrightText: 2025 Copyright (c) Contributors to the Eclipse Foundation
+#
+# See the NOTICE file(s) distributed with this work for additional
+# information regarding copyright ownership.
+#
+# This program and the accompanying materials are made available under the
+# terms of the Apache License Version 2.0 which is available at
+# https://www.apache.org/licenses/LICENSE-2.0
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: Rust CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  # pull-requests: write is required by the coverage job to post PR comments.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  versions:
+    uses: ./.github/workflows/tool-versions.yml
+
+  features:
+    needs: versions
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "--cfg tokio_unstable -L /usr/local/lib"
+      PKG_CONFIG_PATH: "/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ needs.versions.outputs.stable }}
+          components: clippy,rustfmt
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: ${{ needs.versions.outputs.protoc }}
+          # The action queries the GitHub API to fetch releases data,
+          # to avoid rate limiting, passing the default token.
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Setup DLT tracing lib
+        uses: eclipse-opensovd/dlt-tracing-lib/.github/actions/setup-dlt@main
+      - name: Build all features
+        run: make build-all-features
+      - name: Verify generated files are up to date
+        run: |
+          if ! git diff --exit-code cda-database/src/flatbuf/diagnostic_description.rs cda-database/src/proto/fileformat.rs; then
+            echo ""
+            echo "::error::Generated files are out of date."
+            echo "Regenerate flatbuffers with: make generate-flatbuffers"
+            echo "Regenerate protos with: make generate-protos"
+            exit 1
+          fi
+          echo "Generated files are up to date."
+      - name: Verify reference config matches generated config
+        run: |
+          make generate-config OUTPUT=/tmp/opensovd-cda.toml
+          if ! diff -u opensovd-cda.toml /tmp/opensovd-cda.toml; then
+            echo ""
+            echo "::error::opensovd-cda.toml does not match configuration generated from code."
+
+            cat <<EOF
+          The opensovd-cda.toml file is a reference generated from the source code.
+          You should not edit it directly and it needs to be regenerated when you
+          edit the configuration fields in the source code.
+
+          You can regenerate it with:
+          make generate-config
+
+          You will need DLT installed as a library on your system.
+          You can install it like so:
+            * On Debian-based systems: apt install libdlt-dev
+            * On macOS with Homebrew:
+              brew tap COVESA/dlt-daemon https://github.com/COVESA/dlt-daemon
+              brew install COVESA/dlt-daemon/dlt-daemon
+          EOF
+            exit 1
+          fi
+          echo "opensovd-cda.toml is up to date."
+      # note: if openssl and mbedtls are enabled falls back to openssl
+      # therefore we build mbedtls separately as well
+      - name: Build mbedtls features
+        run: make build-mbedtls
+      - name: Build minimal features
+        run: make build-minimal
+      - name: Build minimal CDA only
+        # Building CDA only makes sure that optional dependencies
+        # from within the workspace are properly marked as optional and guarded
+        # with cfg flags.
+        run: make build-minimal-cda
+
+  build_and_test:
+    needs: versions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ needs.versions.outputs.stable }}
+          components: clippy, rustfmt, llvm-tools
+      - name: Install cargo-deny
+        run: cargo install --locked --version "${{ needs.versions.outputs.cargo_deny }}" cargo-deny
+      - name: Install cargo-llvm-cov
+        run: cargo install --locked --version "${{ needs.versions.outputs.cargo_llvm_cov }}" cargo-llvm-cov
+      - name: Build
+        run: make build
+      - name: Check licenses
+        run: make deny ARGS=licenses
+      - name: Check allowed sources
+        run: make deny ARGS=sources
+      - name: Check banned practises
+        run: make deny ARGS=bans
+      # In order to utilize caching, the docker images need to be built in the github action.
+      - name: Build CDA docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: testcontainer/cda/Dockerfile
+          build-args: |
+            RUST_VERSION=${{ needs.versions.outputs.stable }}
+          push: false
+          tags: ghcr.io/${{ github.repository }}/opensovd-cda:latest
+          load: true
+          cache-from: |
+            type=gha,scope=cda-cargo-${{ github.ref_name }}
+            type=gha,scope=cda-cargo-main
+            type=gha,scope=cda-sccache-${{ github.ref_name }}
+            type=gha,scope=cda-sccache-main
+          cache-to: |
+            type=gha,mode=max,scope=cda-cargo-${{ github.ref_name }}
+            type=gha,mode=max,scope=cda-sccache-${{ github.ref_name }}
+      - name: Build CDA docker image (coverage-enabled)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: testcontainer/cda/Dockerfile
+          build-args: |
+            RUST_VERSION=${{ needs.versions.outputs.stable }}
+            BUILD_PROFILE=dev
+            RUSTFLAGS=-C instrument-coverage
+          push: false
+          tags: ghcr.io/${{ github.repository }}/opensovd-cda:coverage
+          load: true
+          cache-from: |
+            type=gha,scope=cda-cargo-${{ github.ref_name }}
+            type=gha,scope=cda-cargo-main
+            type=gha,scope=cda-sccache-${{ github.ref_name }}
+            type=gha,scope=cda-sccache-main
+          cache-to: |
+            type=gha,mode=max,scope=cda-cargo-${{ github.ref_name }}
+            type=gha,mode=max,scope=cda-sccache-${{ github.ref_name }}
+      - name: Build ECU Sim docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: testcontainer/ecu-sim/
+          file: testcontainer/ecu-sim/docker/Dockerfile
+          push: false
+          tags: ghcr.io/${{ github.repository }}/ecu-sim:latest
+          load: true
+          cache-from: |
+            type=gha,scope=ecu-sim-gradle-${{ github.ref_name }}
+            type=gha,scope=ecu-sim-gradle-main
+          cache-to: |
+            type=gha,mode=max,scope=ecu-sim-gradle-${{ github.ref_name }}
+      - name: Run unit tests with coverage
+        run: make coverage
+      - name: Run integration tests with Docker coverage
+        env:
+          CACHE_REGISTRY: ghcr.io/${{ github.repository }}
+          # Lets testcontainers-based tests use the image built above.
+          CDA_TEST_IMAGE_NAME: ghcr.io/${{ github.repository }}/opensovd-cda
+          CDA_TEST_IMAGE_TAG: coverage
+          CDA_INTEGRATION_TEST_COVERAGE: "true"
+        run: make integration-test
+      - name: Install lcov
+        run: sudo apt-get update && sudo apt-get install -y lcov
+      - name: Process Docker coverage
+        uses: ./.github/actions/process-docker-coverage
+        with:
+          output-file: lcov-docker.info
+      - name: Merge coverage data
+        run: |
+          set -x
+          if [ -s lcov-docker.info ]; then
+            echo "Merging unit test and Docker integration coverage..."
+            lcov --add-tracefile lcov.info --add-tracefile lcov-docker.info \
+              --output-file lcov-merged.info --ignore-errors inconsistent
+          else
+            echo "No Docker coverage data found, using unit test coverage only"
+            cp lcov.info lcov-merged.info
+          fi
+
+          SUMMARY=$(lcov --summary lcov-merged.info 2>&1 || true)
+          echo "$SUMMARY"
+          TOTAL_COV=$(echo "$SUMMARY" | grep -oP 'lines\.*:\s*\K[0-9.]+' || echo "0")
+          echo "**Line coverage (unit + DoIP integration): ${TOTAL_COV}%**" >> "$GITHUB_STEP_SUMMARY"
+          cp lcov-merged.info lcov-doip.info
+      # The final merged artifact (unit + DoIP + CAN + mixed) is assembled in
+      # the merge_coverage job; this uploads the per-suite share.
+      - name: Upload coverage artifact (unit + DoIP)
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-lcov-doip
+          path: lcov-doip.info
+          retention-days: 30
+  can_integration_tests:
+    name: CAN integration tests
+    needs: versions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ needs.versions.outputs.stable }}
+          components: clippy, rustfmt, llvm-tools
+      # The vcan kernel module backs the socketcand container's shared bus.
+      - name: Load vcan kernel module
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+          sudo modprobe vcan
+      # The CAN suite runs the same containers as the DoIP suite plus a
+      # socketcand daemon (compose profile `can`) that fronts a shared vcan
+      # bus. The CDA image is built with the `can-socketcand` transport and the
+      # ecu-sim connects to the daemon (wired via docker-compose
+      # `SIM_CAN_SOCKETCAND_*`/`CDA_FEATURES`, written into the generated .env by
+      # the test harness). CDA and the ecu-sim reach the bus over TCP.
+      # The suite always runs coverage-instrumented so it counts toward the
+      # merged coverage report (see merge_coverage).
+      - name: Build CDA docker image (can-socketcand, coverage-enabled)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: testcontainer/cda/Dockerfile
+          push: false
+          tags: ghcr.io/${{ github.repository }}/opensovd-cda:coverage
+          load: true
+          build-args: |
+            RUST_VERSION=${{ needs.versions.outputs.stable }}
+            BUILD_PROFILE=dev
+            RUSTFLAGS=-C instrument-coverage
+            CDA_FEATURES=can-socketcand
+          cache-from: |
+            type=gha,scope=cda-can-cargo-${{ github.ref_name }}
+            type=gha,scope=cda-can-cargo-main
+            type=gha,scope=cda-can-sccache-${{ github.ref_name }}
+            type=gha,scope=cda-can-sccache-main
+          cache-to: |
+            type=gha,mode=max,scope=cda-can-cargo-${{ github.ref_name }}
+            type=gha,mode=max,scope=cda-can-sccache-${{ github.ref_name }}
+      - name: Build ECU Sim docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: testcontainer/ecu-sim/
+          file: testcontainer/ecu-sim/docker/Dockerfile
+          push: false
+          tags: ghcr.io/${{ github.repository }}/ecu-sim:latest
+          load: true
+          cache-from: |
+            type=gha,scope=ecu-sim-gradle-${{ github.ref_name }}
+            type=gha,scope=ecu-sim-gradle-main
+          cache-to: |
+            type=gha,mode=max,scope=ecu-sim-gradle-${{ github.ref_name }}
+      # Unit tests gated on the can features (e.g. the CAN example config
+      # validity test) run nowhere else: the main test job uses default
+      # features and the clippy workflow does not execute tests. Collected
+      # under coverage so they count toward the merged report like the
+      # default-features unit tests in build_and_test.
+      - name: Install cargo-llvm-cov
+        run: cargo install --locked --version "${{ needs.versions.outputs.cargo_llvm_cov }}" cargo-llvm-cov
+      - name: Run unit tests with coverage (CAN features)
+        run: make coverage-can
+      - name: Run CAN integration tests
+        env:
+          CACHE_REGISTRY: ghcr.io/${{ github.repository }}
+          # Lets testcontainers-based tests use the image built above.
+          CDA_TEST_IMAGE_NAME: ghcr.io/${{ github.repository }}/opensovd-cda
+          CDA_TEST_IMAGE_TAG: coverage
+          CDA_INTEGRATION_TEST_COVERAGE: "true"
+        # Run serially: the CAN transport is timing-sensitive (per-transaction
+        # TCP sockets + TesterPresent keepalive), so parallel tests can flake.
+        run: make integration-test-can
+      - name: Install lcov
+        run: sudo apt-get update && sudo apt-get install -y lcov
+      - name: Process Docker coverage
+        uses: ./.github/actions/process-docker-coverage
+        with:
+          output-file: lcov-can-docker.info
+      - name: Merge CAN coverage data
+        run: |
+          set -x
+          # Union with the host unit-test coverage (CAN features).
+          if [ -s lcov-can-docker.info ] && [ -s lcov-can-unit.info ]; then
+            lcov --add-tracefile lcov-can-docker.info --add-tracefile lcov-can-unit.info \
+              --output-file lcov-can.info --ignore-errors inconsistent
+          elif [ -s lcov-can-unit.info ]; then
+            cp lcov-can-unit.info lcov-can.info
+          else
+            cp lcov-can-docker.info lcov-can.info
+          fi
+      - name: Upload CAN coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-lcov-can
+          path: lcov-can.info
+          retention-days: 30
+
+  mixed_integration_tests:
+    name: Mixed DoIP+CAN integration tests
+    needs: versions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ needs.versions.outputs.stable }}
+          components: clippy, rustfmt, llvm-tools
+      - name: Load vcan kernel module
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+          sudo modprobe vcan
+      # Mixed mode runs DoIP and CAN simultaneously against the same sim:
+      # TMCC3000/HOVR4000/JGWT5000 are pinned to CAN, FLXC1000 to DoIP, the
+      # remaining ECUs bind to the transport that detects them first. This is
+      # the only job that exercises MultiTransportGateway routing (pins,
+      # DoIP-preferred first detection, sticky bindings) with both gateways
+      # alive, and it also runs the session/security tests that the pure-CAN
+      # job skips.
+      # The suite always runs coverage-instrumented so it counts toward the
+      # merged coverage report (see merge_coverage).
+      - name: Build CDA docker image (can-socketcand, coverage-enabled)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: testcontainer/cda/Dockerfile
+          push: false
+          tags: ghcr.io/${{ github.repository }}/opensovd-cda:coverage
+          load: true
+          build-args: |
+            RUST_VERSION=${{ needs.versions.outputs.stable }}
+            BUILD_PROFILE=dev
+            RUSTFLAGS=-C instrument-coverage
+            CDA_FEATURES=can-socketcand
+          cache-from: |
+            type=gha,scope=cda-can-cargo-${{ github.ref_name }}
+            type=gha,scope=cda-can-cargo-main
+            type=gha,scope=cda-can-sccache-${{ github.ref_name }}
+            type=gha,scope=cda-can-sccache-main
+          cache-to: |
+            type=gha,mode=max,scope=cda-can-cargo-${{ github.ref_name }}
+            type=gha,mode=max,scope=cda-can-sccache-${{ github.ref_name }}
+      - name: Build ECU Sim docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: testcontainer/ecu-sim/
+          file: testcontainer/ecu-sim/docker/Dockerfile
+          push: false
+          tags: ghcr.io/${{ github.repository }}/ecu-sim:latest
+          load: true
+          cache-from: |
+            type=gha,scope=ecu-sim-gradle-${{ github.ref_name }}
+            type=gha,scope=ecu-sim-gradle-main
+          cache-to: |
+            type=gha,mode=max,scope=ecu-sim-gradle-${{ github.ref_name }}
+      - name: Run mixed integration tests
+        env:
+          CACHE_REGISTRY: ghcr.io/${{ github.repository }}
+          # Lets testcontainers-based tests use the image built above.
+          CDA_TEST_IMAGE_NAME: ghcr.io/${{ github.repository }}/opensovd-cda
+          CDA_TEST_IMAGE_TAG: coverage
+          CDA_INTEGRATION_TEST_COVERAGE: "true"
+        run: make integration-test-mixed
+      - name: Process Docker coverage
+        uses: ./.github/actions/process-docker-coverage
+        with:
+          output-file: lcov-mixed.info
+      - name: Upload mixed coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-lcov-mixed
+          path: lcov-mixed.info
+          retention-days: 30
+
+  merge_coverage:
+    name: Merge coverage
+    runs-on: ubuntu-latest
+    needs: [build_and_test, can_integration_tests, mixed_integration_tests]
+    steps:
+      - name: Download per-suite coverage artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: coverage-lcov-*
+          merge-multiple: true
+      - name: Merge coverage data
+        run: |
+          set -x
+          sudo apt-get update && sudo apt-get install -y lcov
+          ADD_ARGS=""
+          for f in lcov-doip.info lcov-can.info lcov-mixed.info; do
+            if [ -s "$f" ]; then
+              ADD_ARGS="$ADD_ARGS --add-tracefile $f"
+            fi
+          done
+          lcov $ADD_ARGS --output-file lcov-merged.info --ignore-errors inconsistent
+          SUMMARY=$(lcov --summary lcov-merged.info 2>&1 || true)
+          echo "$SUMMARY"
+          TOTAL_COV=$(echo "$SUMMARY" | grep -oP 'lines\.*:\s*\K[0-9.]+' || echo "0")
+          echo "**Total line coverage: ${TOTAL_COV}%**" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload merged coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-lcov
+          path: lcov-merged.info
+          retention-days: 30
+      - name: Generate coverage PR comment artifact
+        if: github.event_name == 'pull_request'
+        run: |
+          TOTAL_COV=$(lcov --summary lcov-merged.info 2>&1 | grep -oP 'lines\.*:\s*\K[0-9.]+' || echo "0")
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          SYMBOL="$(printf '\xf0\x9f\x93\x8a')"
+          mkdir -p pr-comment-coverage
+          echo "${{ github.event.number }}" > pr-comment-coverage/pr_number
+          printf '%s\n' \
+            '<!-- coverage-report -->' \
+            "### ${SYMBOL} Coverage Report (unit + DoIP/CAN/mixed integration)" \
+            '' \
+            "**Total line coverage: ${TOTAL_COV}%**" \
+            '' \
+            "[Full build artifacts](${RUN_URL})" \
+            > pr-comment-coverage/body.md
+      - name: Upload coverage PR comment artifact
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr-comment-coverage
+          path: pr-comment-coverage/
+
+  cargo-crap:
+    name: CRAP (Change Risk Anti-Patterns)
+    if: github.event_name == 'pull_request'
+    needs: [merge_coverage, versions]
+    uses: eclipse-opensovd/cicd-workflows/.github/workflows/crap.yml@febc566231f4ff6fafec78c91078e381666120f9
+    with:
+      rust-version: ${{ needs.versions.outputs.stable }}
+      cargo-crap-git-url: "https://github.com/theswiftfox/cargo-crap.git"
+      cargo-crap-git-rev: "27bab7d86c0ff9c4f8f681d6538be24572ca1a8d"
+      lcov-file: "lcov-merged.info"
+      post-pr-comment: true
+      fail-regressions: false
+    permissions:
+      contents: read
+      pull-requests: write
+
+  build_windows:
+    needs: versions
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ needs.versions.outputs.stable }}
+          components: clippy, rustfmt, llvm-tools
+      - name: Install GNU Make
+        run: choco install make --no-progress -y
+      - name: Setup OpenSSL (Windows) Environment
+        run: |
+          echo "OPENSSL_DIR=$env:OPENSSL_DIR" >> $env:GITHUB_ENV
+          echo "OPENSSL_LIB_DIR=$env:OPENSSL_DIR\lib\VC\$env:RUNNER_ARCH\MD" >> $env:GITHUB_ENV
+          echo "OPENSSL_INCLUDE_DIR=$env:OPENSSL_DIR\include" >> $env:GITHUB_ENV
+        env:
+          OPENSSL_DIR: C:\Program Files\OpenSSL
+      - name: Build
+        run: make build
+      - name: Test
+        run: make test ARGS="-- --show-output"

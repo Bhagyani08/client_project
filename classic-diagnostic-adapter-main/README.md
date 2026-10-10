@@ -1,0 +1,409 @@
+<!--
+SPDX-FileCopyrightText: 2026 Copyright (c) Contributors to the Eclipse Foundation
+
+See the NOTICE file(s) distributed with this work for additional
+information regarding copyright ownership.
+
+This program and the accompanying materials are made available under the
+terms of the Apache License Version 2.0 which is available at
+https://www.apache.org/licenses/LICENSE-2.0
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# 🚗 Classic Diagnostic Adapter 🏥
+
+This repository will contain the Classic Diagnostic Adapter of the Eclipse OpenSOVD project and its documentation.
+
+In the SOVD (Service-Oriented Vehicle Diagnostics) context, a Classic Diagnostic Adapter serves as a
+compatibility bridge between traditional (legacy) diagnostic interfaces and the modern SOVD-based
+diagnostic architecture used in next-generation vehicles.
+
+It facilitates the communication to the actual ECUs, by translating the SOVD calls with the
+diagnostic description of the ECU to its UDS via DoIP counterpart.
+
+It handles the communication to the ECUs, by using the communication parameters from the diagnostic description.
+
+## goals
+
+- 🚀 high performance (asynchronous I/O)
+- 🤏 low memory and disk-space consumption
+- 🛡️ safe & secure
+- ⚡ fast startup
+- 🧩 modularity / reusability
+
+## introduction
+
+### usage
+
+1. Obtain one or more `.mdd` files (see prerequisites below).
+2. Start the CDA, pointing it at your databases directory and DoIP interface:
+
+   ```shell
+   cargo run --release -- --databases-dir ./databases --tester-address <YOUR_IP>
+   ```
+
+3. Wait a few seconds for DoIP discovery, then confirm the CDA found your ECUs:
+
+   ```shell
+   curl http://localhost:20002/vehicle/v15/components | jq
+   ```
+
+4. Browse the full API interactively at **<http://localhost:20002/swagger-ui>**.
+
+### prerequisites
+
+To run the CDA you will need at least one `MDD` file. Check out [eclipse-opensovd/odx-converter](https://github.com/eclipse-opensovd/odx-converter) on how to get started with creating `MDD`(s) from ODX.
+
+Once you have the `MDD`(s) you can update the config in `opensovd-cda.toml` to point `database.dir` to the directory containing the files.
+Alternatively you can pass the config via arg `--databases-dir MY_PATH`.
+
+### running
+
+Ensure that the config (`opensovd-cda.toml`) fits your setup:
+
+- tester_address is set to the IP of your DoIP interface.
+- database.dir points to a valid path containing one or more `.mdd` files.
+
+Run the cda via `cargo run --release` or after building from the target directory `./opensovd-cda`
+
+To see the available command line options run `./opensovd-cda -h`
+
+#### protocol selection
+
+Use `--protocol-name` to select the DoIP protocol variant used for com-param lookups in the diagnostic database (matched case-insensitively):
+
+| Flag | Protocol | When to use |
+|------|----------|-------------|
+| `--protocol-name UDS_Ethernet_DoIP_DOBT` *(default)* | DoIP-DOBT | CDA runs inside the vehicle (e.g. on a gateway ECU) |
+| `--protocol-name UDS_Ethernet_DoIP` | DoIP | CDA runs outside the vehicle (laptop, test bench) |
+
+```shell
+# Offboard
+cargo run --release -- --databases-dir ./databases --tester-address <YOUR_IP> --protocol-name UDS_Ethernet_DoIP
+```
+
+## ODX to SOVD path mapping
+
+The CDA translates ODX diagnostic descriptions into SOVD REST resources. The
+mapping is driven by two rules: the `DiagLayerContainer` short name determines
+the component path, and the `DiagService` / `DiagComm` short name — with its
+type-specific affix stripped — determines the resource id within that component.
+
+### Component paths
+
+Each `.mdd` file represents one ECU. The `DiagLayerContainer` short name is
+lowercased to form the component path segment:
+
+| ODX `DiagLayerContainer` short name | SOVD path |
+|--------------------------------------|-----------|
+| `FLXC1000` | `/vehicle/v15/components/flxc1000` |
+| `FSNR2000` | `/vehicle/v15/components/fsnr2000` |
+
+Every component path exposes a fixed set of sub-resources (data, operations,
+configurations, faults, modes, locks).
+
+### Data resources — SID `0x22` / `0x2E`
+
+ODX `DiagService` entries whose request SID is `0x22` (ReadDataByIdentifier)
+are exposed under `/data`. The `_Read`, `_Write`, and `_Dump` suffixes are
+stripped from the `DiagComm` short name to produce the resource id:
+
+| ODX `DiagComm` short name | UDS SID | SOVD path |
+|---------------------------|---------|-----------|
+| `VINDataIdentifier_Read` | `0x22` | `.../data/VINDataIdentifier` |
+| `FluxCapacitorPowerConsumption_Read` | `0x22` | `.../data/FluxCapacitorPowerConsumption` |
+
+If a matching `_Write` service (SID `0x2E`) exists for the same base name, the
+same SOVD id is accessible via `PUT`.
+
+### Operations — SID `0x31`
+
+ODX `RoutineControl` services (SID `0x31`) are exposed under `/operations`. The
+`_Start`, `_Stop`, and `_RequestResults` suffixes are stripped. All sub-function
+variants of the same routine collapse to a single SOVD operation id:
+
+| ODX `DiagComm` short name | UDS SID + sub-function | SOVD path |
+|---------------------------|------------------------|-----------|
+| `SelfTest_Start` | `0x31 0x01` | `.../operations/SelfTest` |
+| `CalibrateSensors_Start` | `0x31 0x01` | `.../operations/CalibrateSensors` |
+| `CalibrateSensors_Stop` | `0x31 0x02` | `.../operations/CalibrateSensors` |
+| `CalibrateSensors_RequestResults` | `0x31 0x03` | `.../operations/CalibrateSensors` |
+
+When `_Stop` or `_RequestResults` services are present, the operation response
+includes `has_stop` / `has_request_results` flags accordingly.
+
+### Configurations — SID `0x22` / `0x2E`, varcoding functional class
+
+Services that belong to the `varcoding` functional class are exposed under
+`/configurations` instead of `/data`. Read and write services for the same base
+name are grouped into a single configuration resource:
+
+| ODX `DiagComm` short name | Functional class | SOVD path |
+|---------------------------|-----------------|-----------|
+| `ActiveDiagnosticSessionDataIdentifier_Read` | `varcoding` | `.../configurations/ActiveDiagnosticSessionDataIdentifier` |
+| `ActiveDiagnosticSessionDataIdentifier_Write` | `varcoding` | `.../configurations/ActiveDiagnosticSessionDataIdentifier` |
+
+### Functional groups — `/functions/{id}`
+
+ODX `FunctionalGroup` layers are exposed under `/functions`. Only groups whose
+short name ends with (suffix position, default) or starts with (prefix position)
+the configured protocol name are included. The matching name is lowercased:
+
+| ODX functional group short name | Protocol config | SOVD path |
+|---------------------------------|-----------------|-----------|
+| `FGL_UDS_Ethernet_DoIP_DOBT` | `UDS_Ethernet_DoIP_DOBT` | `/vehicle/v15/functions/fgl_uds_ethernet_doip_dobt` |
+| `FGL_UDS_Ethernet_DoIP` | `UDS_Ethernet_DoIP` | `/vehicle/v15/functions/fgl_uds_ethernet_doip` |
+
+### Affix stripping
+
+The default affixes stripped from `DiagService` short names are:
+
+| Category | Stripped suffixes |
+|----------|------------------|
+| Data / Configurations (SID `0x22`, `0x2E`) | `_Read`, `_Write`, `_Dump` (and `_Func` variants) |
+| Operations (SID `0x31`) | `_Start`, `_Stop`, `_RequestResults` (and `_Func` variants) |
+| DTC setting (SID `0x85`) | `DTC_Setting_Mode_` prefix |
+
+Matching is case-insensitive. Compound affixes (e.g. `_Read_Dump`) take
+precedence over their base forms (`_Dump`) because order matters — compound
+forms must appear first in the list.
+
+The affix position (prefix or suffix), the list of affixes, and the
+`varcoding` functional class name are all configurable via
+`DatabaseNamingConvention` in `opensovd-cda.toml`.
+
+### End-to-end example
+
+Reading the VIN from ECU `FLXC1000`:
+
+```plain
+# SOVD request
+GET /vehicle/v15/components/flxc1000/data/VINDataIdentifier
+
+# CDA looks up DiagService whose DiagComm short name matches "VINDataIdentifier_Read"
+# and whose request SID is 0x22 (ReadDataByIdentifier), DID = 0xF190
+
+# UDS bytes sent over DoIP
+[0x22, 0xF1, 0x90]
+
+# Positive response received (example)
+[0x62, 0xF1, 0x90, 0x57, 0x30, 0x42, 0x41, 0x58, 0x58, 0x58, 0x58, 0x58, 0x58, ...]
+#  ^    ^     ^     ^--- VIN data bytes, decoded using the ODX DOP
+#  |    +-----+--- echoed DID
+#  +--- response SID (0x22 + 0x40)
+
+# JSON response returned to the SOVD client
+{
+  "data": {
+    "VINDataIdentifier": "W0BAXXXXXXX..."
+  }
+}
+```
+
+Note: `VINDataIdentifier` is the SOVD resource id derived from the parameter name in the ODXs
+`VINDataIdentifier_Read` service. The parameter name and DiagComm name are identical in this case,
+but they may differ in general.
+
+The same pattern applies for write (`PUT`), operations (`POST .../executions`),
+and configurations.
+
+## building
+
+### prerequisites for building & sdk
+
+We recommend using [rustup](https://rustup.rs/) for this.
+The minimum required version of the toolchain is [Rust 1.88.0](https://blog.rust-lang.org/2025/06/26/Rust-1.88.0/).
+
+With `rustup` and [uv](https://docs.astral.sh/uv/) installed, set up the pinned Rust toolchains and development tools:
+
+```shell
+make setup-devenv
+```
+
+The setup target does not install platform-specific system packages. Check required and optional system tools separately with:
+
+```shell
+make doctor
+```
+
+### build the executable
+
+```shell
+cargo build --release
+```
+
+### Windows
+
+Prerequisite:
+
+- Build Toolchain for Windows
+- OpenSSL (if targeting the OpenSSL build)
+   `winget install openssl`
+
+#### Setup Env
+
+```pwsh
+$env:CMAKE_GENERATOR="Ninja"
+$env:OPENSSL_DIR="C:\Program Files\OpenSSL-Win64"
+$env:OPENSSL_LIB_DIR="C:\Program Files\OpenSSL-Win64\lib\VC\x64\MD"
+$env:OPENSSL_INCLUDE_DIR="C:\Program Files\OpenSSL-Win64\include"
+```
+
+## developing
+
+### pre commit
+
+Check staged files:
+
+```shell
+uv run --group tools prek run
+```
+
+Check all files:
+
+```shell
+uv run --group tools prek run --all-files
+```
+
+Install this command as documented here: <https://git-scm.com/book/en/v2/Customizing-Git-Git-Hooks>
+
+### codestyle
+
+see [codestyle](CODESTYLE.md)
+
+### linting
+
+To run clippy with the same settings as the CI/CD pipeline (nightly toolchain, all targets and features, warnings as errors):
+
+```shell
+cargo +nightly-2025-07-14 clippy --all-targets --all-features -- -D warnings
+```
+
+Or using the `cargo lint` alias (stable toolchain, otherwise identical flags):
+
+```shell
+cargo lint
+```
+
+### testing
+
+#### unit tests
+
+Unittests are placed in the relevant module as usual in rust:
+
+```rust
+...
+#[cfg(test)]
+mod test {
+    ...
+}
+```
+
+Run unit tests with:
+
+```shell
+cargo test --locked --lib
+```
+
+#### integration tests
+
+Integration tests are located in the `integration-tests/` directory and test the complete CDA system end-to-end, including:
+
+- SOVD API endpoints
+- ECU communication via DoIP
+- Session management and locking
+
+The integration test framework automatically manages the test environment by:
+
+1. Starting an ECU simulator
+2. Starting the CDA with appropriate configuration
+3. Running tests against the running system
+4. Cleaning up resources after tests complete
+
+##### running integration tests
+
+Docker spins up the ECU simulator and CDA in isolated containers:
+
+```shell
+cargo test --locked --features integration-tests
+```
+
+##### environment variables
+
+The integration test framework supports the following environment variables:
+
+- **`CDA_INTEGRATION_TEST_COVERAGE`** (default: `false`)
+  When set to `true`, uses coverage-instrumented Docker images for integration tests.
+  This enables code coverage collection from tests running inside Docker containers.
+
+  Example:
+
+  ```shell
+  export CDA_INTEGRATION_TEST_COVERAGE=true
+  cargo llvm-cov --locked --features integration-tests --lcov --output-path lcov.info
+  ```
+
+##### test structure
+
+Tests use a shared runtime to avoid repeatedly starting/stopping the CDA and ECU simulator:
+
+- Tests can request exclusive or shared access to the test runtime
+- Exclusive tests hold a mutex lock to prevent concurrent execution
+- The test framework automatically finds available ports when using Docker
+- Test resources (Docker containers, processes) are automatically cleaned up on exit
+
+Example test:
+
+```rust
+#[tokio::test]
+async fn test_ecu_session_switching() {
+    // Request exclusive access to prevent concurrent modifications
+    let (runtime, _lock) = setup_integration_test(true).await.unwrap();
+
+    // runtime.config contains CDA configuration
+    // runtime.ecu_sim contains ECU simulator connection info
+
+    // ... perform test operations ...
+}
+```
+
+### generate module dependency graph for workspace
+
+With the help of [cargo-depgraph](https://github.com/jplatte/cargo-depgraph) a simple diagram showing
+the relations between the workspace crates can be generated. To create a png from the output of
+cargo-depgraph, [Graphviz](https://graphviz.org/) is required.
+
+```shell
+cargo depgraph --target-deps --dedup-transitive-deps --workspace-only | dot -Tpng > depgraph.png
+```
+
+### build with tokio-tracing for tokio-console
+
+To analyze the runtime during execution you can build and run the cda with
+[tokio-console](https://github.com/tokio-rs/console) support.
+
+#### install tokio-console
+
+```shell
+cargo install --locked tokio-console
+```
+
+You need to enable tokio-experimental in the rustflags.
+
+```shell
+RUSTFLAGS="--cfg tokio_unstable" cargo run --release --features tokio-tracing
+```
+
+If you don't want to specify the env all the time, you can add this to your `.cargo/config.toml`
+
+```toml
+[build]
+rustflags = ["--cfg", "tokio_unstable"]
+```
+
+In a second terminal window start `tokio-console` and it should automatically connect.
+
+### architecture
+
+see [overview](https://eclipse-opensovd.github.io/classic-diagnostic-adapter/03_architecture/index.html)

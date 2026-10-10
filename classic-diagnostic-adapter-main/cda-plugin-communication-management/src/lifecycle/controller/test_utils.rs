@@ -1,0 +1,167 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Copyright (c) Contributors to the Eclipse Foundation
+ *
+ * See the NOTICE file(s) distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Apache License Version 2.0 which is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+use std::sync::Arc;
+
+use cda_interfaces::communication_control::{
+    CommControlError, CommunicationAccess, CommunicationError, CommunicationGuard,
+    CommunicationState, DisableCommunication, TransportControl, TransportState,
+    VariantDetectionMode,
+};
+
+struct TestTransport(TransportState);
+
+#[async_trait::async_trait]
+impl TransportControl for TestTransport {
+    async fn enable(&self) -> Result<(), CommControlError> {
+        Ok(())
+    }
+
+    async fn disable(&self) -> Result<(), CommControlError> {
+        Ok(())
+    }
+
+    async fn state(&self) -> TransportState {
+        self.0
+    }
+}
+
+use crate::lifecycle::{
+    CommunicationHandle,
+    disable::{DisableError, DisableReason},
+    state::CommunicationStateStore,
+    worker,
+};
+
+/// Synchronous, all-in-one constructor for test fixtures. Production wiring
+/// goes through [`super::build_communication_runtime`], which stages
+/// construction around the plugin-builder handshake this shortcuts.
+#[must_use]
+pub(crate) fn communication_handle_new(
+    transport_control: Arc<dyn TransportControl>,
+) -> CommunicationHandle {
+    communication_handle_with_detection_mode(transport_control, VariantDetectionMode::Always)
+}
+
+#[must_use]
+pub fn communication_handle_new_noop() -> CommunicationHandle {
+    communication_handle_new(Arc::new(TestTransport(TransportState::Disabled)))
+}
+
+/// As [`communication_handle_new`], but with an explicit detection policy,
+/// for fixtures that exercise `VariantDetectionMode::Never`.
+#[must_use]
+pub(crate) fn communication_handle_with_detection_mode(
+    transport_control: Arc<dyn TransportControl>,
+    variant_detection: VariantDetectionMode,
+) -> CommunicationHandle {
+    let resources = worker::new_resources(transport_control);
+    communication_handle_from_resources(CommunicationState::Disabled, resources, variant_detection)
+}
+
+fn communication_handle_from_resources(
+    initial_state: CommunicationState,
+    resources: worker::WorkerResources,
+    variant_detection: VariantDetectionMode,
+) -> CommunicationHandle {
+    let state = Arc::new(CommunicationStateStore::new(
+        initial_state,
+        variant_detection,
+    ));
+    let (sender, receivers) = worker::channel();
+    let worker_task = Arc::new(tokio::sync::Mutex::new(Some(worker::spawn(
+        Arc::clone(&state),
+        resources,
+        receivers,
+    ))));
+    CommunicationHandle {
+        state,
+        worker: sender,
+        worker_task,
+    }
+}
+
+struct Disable(CommunicationHandle);
+
+#[async_trait::async_trait]
+impl DisableCommunication for Disable {
+    async fn disable(
+        &self,
+        reason: DisableReason,
+    ) -> Result<Box<dyn cda_interfaces::communication_control::DisableGuard>, DisableError> {
+        self.0.disable(reason).await.map(|lease| {
+            Box::new(lease) as Box<dyn cda_interfaces::communication_control::DisableGuard>
+        })
+    }
+}
+
+#[must_use]
+pub fn enabled_communication_access_for_test() -> Arc<dyn CommunicationAccess> {
+    enabled_communication_for_test().0
+}
+
+/// Returns access and disable capabilities backed by the same enabled lifecycle state.
+#[must_use]
+pub fn enabled_communication_for_test()
+-> (Arc<dyn CommunicationAccess>, Arc<dyn DisableCommunication>) {
+    struct Access(CommunicationHandle);
+
+    impl CommunicationAccess for Access {
+        fn state(&self) -> CommunicationState {
+            self.0.state()
+        }
+
+        fn acquire(&self) -> Result<CommunicationGuard, CommunicationError> {
+            self.0.acquire()
+        }
+
+        fn request_activate(
+            &self,
+            _cause: cda_interfaces::communication_control::ActivationCause,
+        ) -> CommunicationState {
+            self.0.request_enable_and_detect()
+        }
+
+        fn variant_detection(&self) -> VariantDetectionMode {
+            // Hardcoded like the state above. This fixture starts `Enabled`
+            // without running an activation, so the handle's effective mode was
+            // never claimed and would report a fixture artifact.
+            VariantDetectionMode::Always
+        }
+    }
+
+    let resources = worker::new_resources(Arc::new(TestTransport(TransportState::Enabled)));
+    let handle = communication_handle_from_resources(
+        CommunicationState::Enabled,
+        resources,
+        VariantDetectionMode::Always,
+    );
+    (Arc::new(Access(handle.clone())), Arc::new(Disable(handle)))
+}
+
+pub fn communication_disable_for_test(
+    transport_control: Arc<dyn TransportControl>,
+    initially_enabled: bool,
+) -> Arc<dyn crate::lifecycle::disable::DisableCommunication> {
+    let handle = if initially_enabled {
+        let resources = worker::new_resources(transport_control);
+        communication_handle_from_resources(
+            CommunicationState::Enabled,
+            resources,
+            VariantDetectionMode::Always,
+        )
+    } else {
+        communication_handle_new(transport_control)
+    };
+    Arc::new(Disable(handle))
+}

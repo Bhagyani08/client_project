@@ -1,0 +1,116 @@
+# SPDX-FileCopyrightText: 2025 Copyright (c) Contributors to the Eclipse Foundation
+#
+# See the NOTICE file(s) distributed with this work for additional
+# information regarding copyright ownership.
+#
+# This program and the accompanying materials are made available under the
+# terms of the Apache License Version 2.0 which is available at
+# https://www.apache.org/licenses/LICENSE-2.0
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "opensovd-cda"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+description = "Eclipse OpenSOVD CDA - A modern open source Classic Diagnostic Adapter written in Rust"
+homepage.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "opensovd-cda"
+path = "src/main.rs"
+
+[lib]
+name = "opensovd_cda_lib"
+path = "src/lib.rs"
+
+[dependencies]
+cda-core = { workspace = true }
+cda-comm-can = { workspace = true }
+cda-comm-doip = { workspace = true }
+cda-transport-router = { workspace = true }
+cda-comm-uds = { workspace = true }
+cda-database = { workspace = true }
+cda-interfaces = { workspace = true }
+cda-sovd = { workspace = true }
+cda-tracing = { workspace = true }
+cda-plugin-lock-priority = { workspace = true }
+cda-plugin-security = { workspace = true }
+cda-health = { workspace = true }
+cda-extra = { workspace = true, optional = true }
+cda-plugin-communication-management = { workspace = true }
+cda-plugin-runtime-update = { workspace = true }
+cda-storage = { workspace = true }
+# args
+clap = { workspace = true, features = ["derive", "env"] }
+backon = { workspace = true }
+# config
+figment = { workspace = true, features = ["env", "toml"] }
+toml = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+# allocator
+mimalloc = { git = "https://github.com/theswiftfox/mimalloc.git", rev = "afbaaa5" }
+schemars = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = [
+  "rt-multi-thread",
+  "macros",
+  "io-util",
+  "time",
+  "signal",
+] }
+# logging & tracing
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = [
+  "ansi",
+  "chrono",
+  "env-filter",
+  "fmt",
+  "json",
+  "parking_lot",
+  "std",
+] }
+
+[dev-dependencies]
+chrono = { workspace = true }
+tempfile = { workspace = true }
+override-macros = { workspace = true }
+linkme = { workspace = true }
+cda-plugin-security = { workspace = true, features = ["test-utils"] }
+
+[build-dependencies]
+chrono = { workspace = true }
+
+[features]
+default = ["health", "openssl", "config-optional"]
+# Uses Rust's system allocator so allocator-interposition profilers such as
+# Heaptrack and Valgrind can attribute CDA allocations.
+heap-profiling = []
+tokio-tracing = ["cda-interfaces/tokio-tracing", "cda-tracing/tokio-tracing"]
+openssl = ["cda-comm-doip/openssl"]
+openssl-vendored = [
+  "openssl",
+  "cda-comm-doip/openssl-vendored",
+]
+mbedtls = ["cda-comm-doip/mbedtls"]
+can = ["cda-comm-can/can"]
+# Userspace ISO-TP over raw CAN (`rawcan:<ifname>` interface scheme):
+# vcan suffices, no can_isotp kernel module needed.
+can-isotp-userspace = ["can", "cda-comm-can/can-isotp-userspace"]
+# CAN frames over a socketcand daemon (`socketcand:<host>:<port>:<bus>`
+# interface scheme): the client needs no kernel CAN; also available off-Linux.
+can-socketcand = ["can-isotp-userspace", "cda-comm-can/can-socketcand"]
+dlt-tracing = ["cda-tracing/dlt-tracing"]
+integration-tests = []
+
+health = []
+config-optional = []
+systemd-notify = ["dep:cda-extra", "cda-extra/systemd-notify"]

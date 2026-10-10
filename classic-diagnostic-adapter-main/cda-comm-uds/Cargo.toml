@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: 2025 Copyright (c) Contributors to the Eclipse Foundation
+#
+# See the NOTICE file(s) distributed with this work for additional
+# information regarding copyright ownership.
+#
+# This program and the accompanying materials are made available under the
+# terms of the Apache License Version 2.0 which is available at
+# https://www.apache.org/licenses/LICENSE-2.0
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "cda-comm-uds"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+description = "UDS communication layer used in CDA"
+homepage.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# internal dependencies
+cda-interfaces = { workspace = true }
+
+async-trait = { workspace = true }
+
+#tokio
+tokio = { workspace = true, features = ["sync", "fs", "time", "rt", "io-util"] }
+tokio-util = { workspace = true, features = ["rt"] }
+#futures
+futures = { workspace = true }
+
+serde_json = { workspace = true }
+
+# actor framework
+kameo = { workspace = true }
+
+# logging & tracing
+tracing = { workspace = true }
+strum = { workspace = true, features = ["derive"] }
+
+[features]
+default = []
+dlt-tracing = ["cda-interfaces/dlt-tracing"]
+
+[build-dependencies]
+cda-build = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+cda-plugin-communication-management = { workspace = true, features = ["test-utils"] }
