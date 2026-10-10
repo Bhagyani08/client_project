@@ -1,0 +1,314 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 Contributors to the Eclipse Foundation
+// SPDX-License-Identifier: Apache-2.0
+
+use axum::{
+    Router,
+    extract::{Path, State},
+    http::request::Parts,
+    response::Json,
+    routing::get,
+};
+use axum_extra::extract::{Query, WithRejection};
+use opensovd_core::Topology;
+use opensovd_models::Response;
+use opensovd_models::discovery::{
+    Entities, EntitiesQuery, EntityCapabilities, EntityCapabilitiesQuery, EntityReference,
+};
+
+use super::super::AppState;
+use super::super::error::{Error, Result};
+use super::encode_path_segment;
+use crate::schema::JsonSchema;
+
+pub(super) fn routes<V>() -> Router<AppState<V>>
+where
+    V: Clone + Send + Sync + 'static,
+{
+    Router::new()
+        .route("/components", get(component_list))
+        .route("/components/{component_id}", get(component_capabilities))
+        .route("/components/{component_id}/hosts", get(component_hosts))
+}
+
+/// GET /components - Discover contained components.
+///
+/// Returns the list of components known to the SOVD server.
+pub(super) async fn component_list(
+    State(topology): State<Topology>,
+    parts: Parts,
+    Query(query): Query<EntitiesQuery>,
+) -> Result<Json<Response<Entities>>> {
+    let base = super::super::versioned_uri(&parts);
+    let items = topology
+        .read()
+        .await
+        .components()
+        .filter(|e| {
+            let tags = e.tags();
+            query.tags.is_empty() || query.tags.iter().any(|t| tags.contains(t))
+        })
+        .map(|e| {
+            let tags = e.tags();
+            EntityReference {
+                id: e.id().to_string(),
+                name: e.name().to_string(),
+                translation_id: e.translation_id().map(String::from),
+                href: format!("{base}/components/{}", encode_path_segment(e.id())).into(),
+                tags: (!tags.is_empty()).then_some(tags.to_vec()),
+            }
+        })
+        .collect();
+
+    Ok(Json(Response {
+        data: Entities { items },
+        schema: query.include_schema.then(Entities::schema),
+    }))
+}
+
+/// GET `/components/:component_id` - Query capabilities of a component.
+///
+/// Returns the capabilities of a specific component.
+pub(super) async fn component_capabilities(
+    State(topology): State<Topology>,
+    Path(component_id): Path<String>,
+    parts: Parts,
+    WithRejection(Query(query), _): WithRejection<Query<EntityCapabilitiesQuery>, Error>,
+) -> Result<Json<Response<EntityCapabilities>>> {
+    let topo = topology.read().await;
+    let entity = topo
+        .get_component(&component_id)
+        .map_err(|_| Error::EntityNotFound(component_id.clone()))?;
+
+    let variant = (!entity.metadata().is_empty()).then(|| entity.metadata().clone());
+    let translation_id = entity.translation_id().map(String::from);
+
+    let base = super::super::versioned_uri(&parts);
+    // Relation links are only advertised when the relation is not empty.
+    let hosts = topo
+        .apps_of_component(&component_id)
+        .next()
+        .is_some()
+        .then(|| {
+            format!(
+                "{base}/components/{}/hosts",
+                encode_path_segment(&component_id)
+            )
+            .into()
+        });
+
+    // A direct reference, advertised only when the area exists.
+    let belongs_to = topo
+        .area_of_component(&component_id)
+        .ok()
+        .flatten()
+        .map(|area| format!("{base}/areas/{}", encode_path_segment(area.id())).into());
+
+    let data = entity.data_provider().map(|_| {
+        format!(
+            "{base}/components/{}/data",
+            encode_path_segment(&component_id)
+        )
+        .into()
+    });
+
+    let bulk_data = entity.bulkdata_provider().map(|_| {
+        format!(
+            "{base}/components/{}/bulk-data",
+            encode_path_segment(&component_id)
+        )
+        .into()
+    });
+
+    Ok(Json(Response {
+        data: EntityCapabilities {
+            id: component_id,
+            name: entity.name().to_string(),
+            translation_id,
+            variant,
+            hosts,
+            belongs_to,
+            data,
+            bulk_data,
+            ..Default::default()
+        },
+        schema: query.include_schema.then(EntityCapabilities::schema),
+    }))
+}
+
+/// GET `/components/:component_id/hosts` - List apps hosted on a component.
+///
+/// Returns the list of apps running on a specific component.
+pub(super) async fn component_hosts(
+    State(topology): State<Topology>,
+    Path(component_id): Path<String>,
+    parts: Parts,
+    Query(query): Query<EntitiesQuery>,
+) -> Result<Json<Response<Entities>>> {
+    // Verify component exists and get hosted apps atomically
+    let topo = topology.read().await;
+    topo.get_component(&component_id)
+        .map_err(|_| Error::EntityNotFound(component_id.clone()))?;
+
+    let apps = topo.apps_of_component(&component_id);
+
+    let base = super::super::versioned_uri(&parts);
+    let items: Vec<EntityReference> = apps
+        .filter(|e| {
+            let tags = e.tags();
+            query.tags.is_empty() || query.tags.iter().any(|t| tags.contains(t))
+        })
+        .map(|e| {
+            let tags = e.tags();
+            let translation_id = e.translation_id().map(String::from);
+            EntityReference {
+                id: e.id().to_string(),
+                name: e.name().to_string(),
+                translation_id,
+                href: format!("{base}/apps/{}", encode_path_segment(e.id())).into(),
+                tags: (!tags.is_empty()).then_some(tags.to_vec()),
+            }
+        })
+        .collect();
+
+    Ok(Json(Response {
+        data: Entities { items },
+        schema: query.include_schema.then(Entities::schema),
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use opensovd_mocks::create_mock_topology;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_component_capabilities_ecu() {
+        let state = AppState::<()> {
+            vendor_info: None,
+            topology: create_mock_topology().await,
+        };
+        let app = routes::<()>()
+            .with_state(state)
+            .layer(crate::routes::test_base_uri());
+
+        let request = Request::builder()
+            .uri("/components/ecu")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert!(response.status().is_success());
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["id"], "ecu");
+        assert_eq!(json["name"], "Engine Control Unit");
+        assert_eq!(
+            json["hosts"],
+            "http://localhost/sovd/v1/components/ecu/hosts"
+        );
+        assert_eq!(
+            json["belongs-to"],
+            "http://localhost/sovd/v1/areas/powertrain"
+        );
+        assert_eq!(json["data"], "http://localhost/sovd/v1/components/ecu/data");
+    }
+
+    #[tokio::test]
+    async fn test_component_capabilities_omit_empty_relations() {
+        let topology = create_mock_topology().await;
+        topology
+            .write()
+            .await
+            .add_component(opensovd_core::Component::new("spare", "Spare ECU"));
+        let state = AppState::<()> {
+            vendor_info: None,
+            topology,
+        };
+        let app = routes::<()>()
+            .with_state(state)
+            .layer(crate::routes::test_base_uri());
+
+        let request = Request::builder()
+            .uri("/components/spare")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert!(response.status().is_success());
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["id"], "spare");
+        assert!(json.get("hosts").is_none());
+        assert!(json.get("belongs-to").is_none());
+
+        // Not advertised, but still served as an empty list.
+        let request = Request::builder()
+            .uri("/components/spare/hosts")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["items"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_component_capabilities_skip_removed_area() {
+        let topology = create_mock_topology().await;
+        topology.write().await.remove_area("powertrain");
+        let state = AppState::<()> {
+            vendor_info: None,
+            topology,
+        };
+        let app = routes::<()>()
+            .with_state(state)
+            .layer(crate::routes::test_base_uri());
+
+        let request = Request::builder()
+            .uri("/components/ecu")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert!(response.status().is_success());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("belongs-to").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_component_list() {
+        let state = AppState::<()> {
+            vendor_info: None,
+            topology: create_mock_topology().await,
+        };
+        let app = routes::<()>()
+            .with_state(state)
+            .layer(crate::routes::test_base_uri());
+
+        let request = Request::builder()
+            .uri("/components")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert!(response.status().is_success());
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let items = json["items"].as_array().expect("items should be an array");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["id"], "ecu");
+        assert_eq!(items[0]["name"], "Engine Control Unit");
+        assert_eq!(items[0]["href"], "http://localhost/sovd/v1/components/ecu");
+    }
+}

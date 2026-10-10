@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Contributors to the Eclipse Foundation
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "opensovd-extra"
+version.workspace = true
+description.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+unit = ["dep:serde"]
+auth = ["dep:jsonwebtoken", "dep:regorus", "dep:serde", "dep:serde_json", "dep:http", "dep:tracing", "dep:opensovd-server"]
+tls = ["dep:rustls", "dep:thiserror"]
+trace = ["dep:axum", "dep:http", "dep:tower", "dep:tower-http", "dep:tracing"]
+mdns = ["dep:mdns-sd", "dep:if-addrs", "dep:rustix", "dep:thiserror", "dep:tokio", "dep:tracing"]
+
+[dependencies]
+opensovd-server = { workspace = true, optional = true }
+axum = { workspace = true, optional = true, features = ["matched-path"] }
+jsonwebtoken = { workspace = true, optional = true }
+regorus = { workspace = true, optional = true }
+serde = { workspace = true, optional = true, features = ["derive", "std"] }
+serde_json = { workspace = true, optional = true, features = ["std"] }
+http = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true, features = ["std"] }
+thiserror = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true, features = ["trace"] }
+mdns-sd = { workspace = true, optional = true, features = ["async"] }
+if-addrs = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["rt", "time"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, optional = true, features = ["std", "system"] }
+
+[dev-dependencies]
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
+bytes = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tracing = { workspace = true, features = ["std"] }
+tracing-subscriber = { workspace = true, features = ["registry", "std"] }
+http = { workspace = true }
+aws-lc-rs = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true, features = ["std", "std_rng", "thread_rng"] }
+tempfile = { workspace = true }
+rcgen = { workspace = true }
+
+[lints]
+workspace = true

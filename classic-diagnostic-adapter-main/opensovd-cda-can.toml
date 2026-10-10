@@ -22,7 +22,7 @@ address = "0.0.0.0"
 port = 20002
 
 [database]
-dir = "./mdds"
+dir = "./testcontainer/odx"
 fallback_to_base_variant = true
 
 # DoIP is disabled. The block is still required (Configuration.doip is
@@ -38,7 +38,7 @@ send_timeout_ms = 1000
 # CAN bus configuration
 [can]
 # CAN interface name (e.g., "vxcan0", "can0", "vcan0")
-interface = "vxcan0"
+interface = "vcan0"
 
 # Response timeout in milliseconds (default: 5000ms)
 response_timeout_ms = 2000

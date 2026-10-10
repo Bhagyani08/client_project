@@ -1,0 +1,441 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Contributors to the Eclipse Foundation
+# SPDX-License-Identifier: Apache-2.0
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  schedule:
+    - cron: '0 2 * * *' # 02:00 UTC daily
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_WARNINGS: deny
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      release: ${{ steps.check.outputs.release }}
+      channel: ${{ steps.check.outputs.channel }}
+      sha: ${{ steps.check.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        if: github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/v')
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - id: check
+        env:
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          should_run=true
+          release=none
+          if [[ "$EVENT" == "schedule" ]]; then
+            if [[ "$(git rev-parse nightly 2>/dev/null || true)" == "$SHA" ]]; then
+              echo "No changes since last nightly, skipping"
+              should_run=false
+            else
+              release=nightly
+            fi
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+            if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match workspace version $version"
+              exit 1
+            fi
+            release=$GITHUB_REF_NAME
+          elif [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
+            release=latest
+          fi
+
+          # The channel follows from the release type: only a version tag is stable.
+          case "$release" in
+            v*)      channel=stable ;;
+            nightly) channel=nightly ;;
+            *)       channel=dev ;;
+          esac
+
+          {
+            echo "should_run=$should_run"
+            echo "release=$release"
+            echo "channel=$channel"
+            echo "sha=${SHA::7}"
+          } >> "$GITHUB_OUTPUT"
+
+  git-lint:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    name: build (${{ matrix.binary }}, ${{ matrix.target.triple }}${{ matrix.target.coverage && ', coverage' || '' }})
+    needs: prepare
+    if: needs.prepare.outputs.should_run == 'true'
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      OPENSOVD_CHANNEL: ${{ needs.prepare.outputs.channel }}
+      OPENSOVD_COMMIT_SHA: ${{ needs.prepare.outputs.sha }}
+    # Git Bash on Windows, so the bash tasks run the same on every runner.
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        binary: [gateway, mcp]
+        target:
+          - {triple: x86_64-unknown-linux-gnu, os: ubuntu-24.04, tests: [unit, integration], container: true}
+          - {triple: x86_64-unknown-linux-gnu, os: ubuntu-24.04, tests: [unit, integration], coverage: true}
+          - {triple: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, tests: [unit], container: true}
+          - {triple: x86_64-pc-windows-msvc, os: windows-2025-vs2026, tests: [unit]}
+          - {triple: aarch64-apple-darwin, os: macos-15, tests: [unit]}
+    runs-on: ${{ matrix.target.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/mise
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.binary }}${{ matrix.target.coverage && '-coverage' || '' }}
+          workspaces: ${{ matrix.target.coverage && '. -> target/coverage' || '. -> target' }}
+          cache-on-failure: true
+
+      # A coverage job builds and tests instrumented in one task; the others
+      # build the release binary and test it stage by stage.
+      - if: ${{ !matrix.target.coverage }}
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target.triple }}
+        run: mise run build ${{ matrix.binary }}
+
+      - if: ${{ !matrix.target.coverage && contains(matrix.target.tests, 'unit') }}
+        run: mise run test:unit ${{ matrix.binary }}
+
+      - if: contains(matrix.target.tests, 'integration')
+        name: Allow unprivileged user namespaces for the network namespace tests
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - if: ${{ !matrix.target.coverage && contains(matrix.target.tests, 'integration') }}
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target.triple }}
+        run: mise run test:integration ${{ matrix.binary }}
+
+      - if: matrix.target.coverage
+        run: mise run coverage ${{ matrix.binary }} --tests ${{ join(matrix.target.tests, ',') }}
+
+      - if: matrix.target.container
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target.triple }}
+        run: mise run container ${{ matrix.binary }}
+
+      - if: ${{ !matrix.target.coverage }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: opensovd-${{ matrix.binary }}-${{ matrix.target.triple }}
+          path: target/${{ matrix.target.triple }}/release-small/opensovd-${{ matrix.binary }}${{ runner.os == 'Windows' && '.exe' || '' }}
+
+      # The coverage job merges these into one report for all binaries.
+      - if: matrix.target.coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-data-${{ matrix.binary }}-${{ matrix.target.triple }}
+          path: target/coverage-data/${{ matrix.binary }}-${{ matrix.target.triple }}.tar.gz
+
+      # The docker job builds each binary's multi-arch image from these.
+      - if: matrix.target.container && needs.prepare.outputs.release != 'none'
+        uses: actions/upload-artifact@v7
+        with:
+          name: image-opensovd-${{ matrix.binary }}-${{ matrix.target.triple }}
+          path: target/${{ matrix.target.triple }}/release-small/opensovd-${{ matrix.binary }}
+
+      # Every stage writes its report under target/reports/<binary>/<triple>/<stage>.
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: reports-${{ matrix.binary }}-${{ matrix.target.triple }}${{ matrix.target.coverage && '-coverage' || '' }}
+          path: target/reports/
+          if-no-files-found: ignore
+
+      - if: matrix.target.coverage
+        env:
+          REPORT: target/reports/${{ matrix.binary }}/${{ matrix.target.triple }}/coverage
+        run: cat "$REPORT/detail.md" >> "$GITHUB_STEP_SUMMARY"
+
+  coverage:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_run == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/mise
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: coverage-data-*
+          path: target/coverage-data
+          merge-multiple: true
+
+      - run: mise run coverage --merge
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: reports-all-x86_64-unknown-linux-gnu-coverage
+          path: target/reports/
+
+      - run: cat target/reports/all/x86_64-unknown-linux-gnu/coverage/detail.md >> "$GITHUB_STEP_SUMMARY"
+
+  # The only job with a PR write token, so it checks out and runs nothing from
+  # the PR. Forks get a read-only token and are skipped.
+  coverage-comment:
+    needs: [build, coverage]
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: reports-*-coverage
+          path: reports
+          merge-multiple: true
+
+      # Post or update a sticky comment per report, identified by the marker
+      # on its first line.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          for summary in reports/*/*/coverage/summary.md; do
+            jq -Rs '{body: .}' "$summary" > comment.json
+            marker=$(head -n1 "$summary")
+            id=$(gh api --paginate "repos/${REPO}/issues/${PR}/comments" \
+              | jq -r --arg marker "$marker" '.[] | select(.body | startswith($marker)) | .id' | head -n1)
+            if [ -n "$id" ]; then
+              gh api --method PATCH "repos/${REPO}/issues/comments/${id}" --input comment.json >/dev/null
+            else
+              gh api --method POST "repos/${REPO}/issues/${PR}/comments" --input comment.json >/dev/null
+            fi
+          done
+
+  licenses:
+    needs: prepare
+    if: needs.prepare.outputs.should_run == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/mise
+      - run: mise run licenses
+
+  advisories:
+    needs: prepare
+    if: needs.prepare.outputs.should_run == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/mise
+      - run: mise run advisories
+
+  lint:
+    needs: prepare
+    if: needs.prepare.outputs.should_run == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/mise
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      # Cache prek hooks
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/prek
+          key: prek-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: |
+            prek-${{ runner.os }}-
+
+      - run: mise run lint
+
+      - name: Allow unprivileged user namespaces for the network namespace tests
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - run: mise run test:self
+
+      - if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: mise run lint:commits "$BASE_SHA..$HEAD_SHA"
+
+  pages:
+    needs: [prepare, build, coverage]
+    if: needs.prepare.outputs.should_run == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: reports-*
+          path: site
+          merge-multiple: true
+
+      # Link every report the build jobs produced, one per binary, target and stage.
+      - working-directory: site
+        run: |
+          items=
+          for stage in */*/*/; do
+            stage=${stage%/}
+            page=$(find "$stage" -name index.html | sort | head -n1)
+            [ -n "$page" ] || page=$(find "$stage" -type f | sort | head -n1)
+            if [ -n "$page" ]; then
+              items+="<li><a href=\"$page\">${stage//\// / }</a></li>"
+            fi
+          done
+          echo "<!doctype html><meta charset=\"utf-8\"><title>OpenSOVD reports</title><ul>${items}</ul>" > index.html
+
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+      - uses: actions/deploy-pages@v5
+
+  docker:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.release != 'none'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    env:
+      DOCKER_BUILD_SUMMARY: false
+      DOCKER_BUILD_RECORD_UPLOAD: false
+    strategy:
+      fail-fast: false
+      matrix:
+        binary: [gateway, mcp]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: image-opensovd-${{ matrix.binary }}-*
+      - uses: ./.github/actions/mise
+      - uses: ./.github/actions/docker-publish
+        with:
+          binary: opensovd-${{ matrix.binary }}
+          dockerfile: docker/Dockerfile.${{ matrix.binary }}
+          release-tag: ${{ needs.prepare.outputs.release }}
+
+  release:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.release != 'none'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/mise
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: opensovd-*
+
+      # Each artifact opensovd-<binary>-<triple> holds one binary.
+      - run: |
+          VERSION="${{ needs.prepare.outputs.release }}"
+          if [[ "${{ needs.prepare.outputs.channel }}" != "stable" ]]; then
+            git cliff --unreleased -o CHANGELOG.md
+          else
+            git cliff --current -o CHANGELOG.md
+          fi
+          mkdir -p artifacts/release
+          for dir in artifacts/opensovd-*/; do
+            dir=${dir%/}
+            files=("$dir"/*)
+            file=${files[0]##*/}
+            binary=${file%.exe}
+            target=${dir#artifacts/"${binary}"-}
+            if [[ "$target" == *windows* ]]; then
+              zip "artifacts/release/${binary}-${VERSION}-${target}.zip" "$dir/${file}"
+            else
+              chmod +x "$dir/${file}"
+              tar -czf "artifacts/release/${binary}-${VERSION}-${target}.tar.gz" -C "$dir" "${file}"
+            fi
+          done
+          cd artifacts/release
+          for file in *.tar.gz *.zip; do
+            sha512sum "$file" > "$file.sha512"
+          done
+
+      - uses: actions/attest-build-provenance@v4
+        if: github.repository_owner == 'eclipse-opensovd'
+        with:
+          subject-path: 'artifacts/release/*'
+
+      - name: Delete existing prerelease
+        if: needs.prepare.outputs.channel != 'stable'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete "${{ needs.prepare.outputs.release }}" --yes --cleanup-tag || true
+
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ needs.prepare.outputs.release }}" \
+            --title "${{ needs.prepare.outputs.release }}" \
+            --notes-file CHANGELOG.md \
+            ${{ needs.prepare.outputs.channel != 'stable' && '--prerelease' || '' }} \
+            artifacts/release/*
+
+  gate:
+    needs: [prepare, git-lint, build, coverage, coverage-comment, licenses, advisories, lint, pages, docker, release]
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more jobs failed"
+            exit 1
+          fi
+          echo "All checks passed (results: ${{ join(needs.*.result, ', ') }})"

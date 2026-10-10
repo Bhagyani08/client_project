@@ -1,0 +1,44 @@
+{
+  "name": "OpenSOVD Core",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "remoteUser": "vscode",
+  "mounts": [
+    "source=opensovd-core-mise,target=/mnt/mise-data,type=volume"
+  ],
+  "containerEnv": {
+    "MISE_DATA_DIR": "/mnt/mise-data",
+    "MISE_RUSTUP_HOME": "/mnt/mise-data/rustup",
+    "MISE_CARGO_HOME": "/mnt/mise-data/cargo",
+    "UV_PROJECT_ENVIRONMENT": "/home/vscode/.venv"
+  },
+  "remoteEnv": {
+    "PATH": "/mnt/mise-data/shims:${containerEnv:PATH}"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "hverlin.mise-vscode",
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "redhat.vscode-yaml",
+        "ms-python.python",
+        "charliermarsh.ruff",
+        "fill-labs.dependi"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "python.defaultInterpreterPath": "/home/vscode/.venv/bin/python",
+        "rust-analyzer.check.command": "clippy",
+        "rust-analyzer.cargo.allFeatures": true,
+        "files.associations": {
+          ".clippy.toml": "toml",
+          "*.toml.j2": "toml"
+        }
+      }
+    }
+  },
+  "forwardPorts": [7690],
+  "onCreateCommand": "bash .devcontainer/on-create.sh"
+}
