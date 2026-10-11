@@ -40,6 +40,46 @@ impl<S: SecurityPlugin> EcuManager<S> {
         self.db_cache.reset().await;
         self.diag_database.unload();
     }
+
+    async fn detect_without_responses(&mut self) -> Result<(), DiagServiceError> {
+        if self.variant_detection.diag_service_requests.is_empty() {
+            if !self.fallback_to_base_variant {
+                self.clear_variant_and_unload(
+                    VariantState::NotDetected,
+                    Some(Connectivity::Online),
+                )
+                .await;
+                return Err(DiagServiceError::VariantDetectionError(format!(
+                    "No variant detection requests configured for ECU {}",
+                    self.ecu_name
+                )));
+            }
+
+            let base_variant = match self.diag_database.base_variant() {
+                Ok(base_variant) => base_variant,
+                Err(error) => {
+                    self.clear_variant_and_unload(
+                        VariantState::NotDetected,
+                        Some(Connectivity::Online),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+            return self
+                .set_variant(VariantData::from_variant_and_fallback(&base_variant, true))
+                .await;
+        }
+
+        let current_variant_state = {
+            let mut ecu_state = std_ext::lock_write(&self.runtime_state.ecu_state);
+            ecu_state.connectivity = Connectivity::Offline;
+            ecu_state.variant_state.clone()
+        };
+        self.runtime_state
+            .publish_variant_state(current_variant_state);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -68,17 +108,7 @@ impl<S: SecurityPlugin> VariantDetection for EcuManager<S> {
         if service_responses.is_empty() {
             // No responses means ECU is unreachable -> set connectivity to Offline.
             // Variant state is intentionally preserved (we still know what variant it was).
-            let current_variant_state = {
-                let mut ecu_state = std_ext::lock_write(&self.runtime_state.ecu_state);
-                ecu_state.connectivity = Connectivity::Offline;
-                ecu_state.variant_state.clone()
-            };
-            // Publish unconditionally, even when unchanged. This is the ECU's
-            // detection attempt settling, and anything awaiting its conclusion
-            // must be woken rather than left to its own timeout.
-            self.runtime_state
-                .publish_variant_state(current_variant_state);
-            return Ok(());
+            return self.detect_without_responses().await;
         }
 
         match variant_detection::evaluate_variant(service_responses, &self.diag_database) {

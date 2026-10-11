@@ -22,7 +22,7 @@ address = "0.0.0.0"
 port = 20002
 
 [database]
-dir = "./testcontainer/odx"
+dir = "/app/odx"
 fallback_to_base_variant = true
 
 # DoIP is disabled. The block is still required (Configuration.doip is
@@ -38,7 +38,7 @@ send_timeout_ms = 1000
 # CAN bus configuration
 [can]
 # CAN interface name (e.g., "vxcan0", "can0", "vcan0")
-interface = "vcan0"
+interface = "socketcand:socketcand-vcan1:29537:vcan1"
 
 # Response timeout in milliseconds (default: 5000ms)
 response_timeout_ms = 2000
@@ -76,9 +76,9 @@ probe_timeout_ms = 100
 # 0x7E0/0x7E8 are the OBD-II request/response IDs and work as a generic
 # default for the test/example MDDs.
 [[can.ecu_mappings]]
-ecu_name = "FLXC1000"
-request_id = 0x7E0
-response_id = 0x7E8
+ecu_name = "E400"
+request_id = 0x700
+response_id = 0x708
 # Optional: ISO-TP addressing mode. Defaults to "standard" (no
 # address-extension byte). "extended" prefixes every ISO-TP payload with
 # the given address-extension byte.
@@ -94,8 +94,7 @@ response_id = 0x7E8
 # exact-match miss the other aliases are tried in order. Alternatively
 # "auto-can" picks the first protocol whose name matches the configured
 # CAN markers (database.naming_convention.can_protocol_markers).
-[ecu.FLXC1000]
-protocol = "UDS_CAN"
+
 
 # Optional: explicit CAN ID mappings
 # Use this to override CAN IDs from MDD files or when MDD doesn't contain them

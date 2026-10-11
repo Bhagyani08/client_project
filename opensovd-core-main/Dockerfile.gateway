@@ -1,0 +1,14 @@
+FROM rust:1.80-bookworm AS builder
+WORKDIR /app
+COPY . .
+RUN cargo build --release -p opensovd-gateway
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/release/opensovd-gateway /usr/local/bin/opensovd-gateway
+
+EXPOSE 7690
+ENV SOVD_URL=http://0.0.0.0:7690/sovd
+ENTRYPOINT ["opensovd-gateway"]
+# Run with the mock flag so the server doesn't crash from an empty topology
+CMD ["--mock"]

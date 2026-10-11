@@ -55,6 +55,10 @@ COPY integration-tests/Cargo.toml ./integration-tests/Cargo.toml
 COPY cda-build/Cargo.toml ./cda-build/Cargo.toml
 COPY opensovd-axum-extra/Cargo.toml ./opensovd-axum-extra/Cargo.toml
 COPY override-macros/Cargo.toml ./override-macros/Cargo.toml
+COPY testcontainer/can-ecu-sim/Cargo.toml ./testcontainer/can-ecu-sim/Cargo.toml
+
+# Create dummy src file for cargo chef since it is part of the workspace
+RUN mkdir -p testcontainer/can-ecu-sim/src && echo "fn main() {}" > testcontainer/can-ecu-sim/src/main.rs
 
 # Generate the recipe.json which describes dependencies
 RUN cargo chef prepare --recipe-path recipe.json
@@ -120,6 +124,8 @@ COPY integration-tests ./integration-tests
 COPY cda-build ./cda-build
 COPY opensovd-axum-extra ./opensovd-axum-extra
 COPY override-macros ./override-macros
+COPY testcontainer/can-ecu-sim ./testcontainer/can-ecu-sim
+
 
 ENV RUSTC_WRAPPER=sccache \
     SCCACHE_DIR=/sccache

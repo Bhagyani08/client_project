@@ -239,7 +239,7 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
             .into_iter()
             .filter_map(|dl| dl.com_param_refs())
             .flat_map(|cp_ref_vec| cp_ref_vec.iter())
-            .filter(|cp_ref| {
+            .inspect(|cp_ref| tracing::warn!("Seeing cp_ref: name={:?} proto={:?}", cp_ref.com_param().and_then(|c| c.short_name()), cp_ref.protocol().is_some())).filter(|cp_ref| {
                 cp_ref.protocol().is_some_and(|p| {
                     p.diag_layer().is_some_and(|dl| {
                         dl.short_name()
@@ -1028,6 +1028,28 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn empty_detection_requests_fall_back_to_base_variant() {
+        let mut ecu_manager = create_ecu_manager_variant_detection(true);
+        ecu_manager.variant_detection.diag_service_requests.clear();
+
+        ecu_manager
+            .detect_variant::<DiagServiceResponseStruct>(HashMap::new())
+            .await
+            .unwrap();
+
+        let status = ecu_manager.runtime_state.status();
+        assert_eq!(status.connectivity, Connectivity::Online);
+        assert_eq!(
+            status.variant_state,
+            VariantState::Detected {
+                name: "BaseVariant".to_owned(),
+                is_base_variant: true,
+                is_fallback: true,
+            }
+        );
     }
 
     #[tokio::test]

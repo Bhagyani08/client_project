@@ -98,6 +98,7 @@ impl DataRequest<'_> {
             client: self.client,
             path: self.path.clone(),
             schema: false,
+            authorization: None,
         }
     }
 
@@ -120,6 +121,7 @@ pub struct ReadDataRequest<'a> {
     client: &'a Client,
     path: String,
     schema: bool,
+    authorization: Option<String>,
 }
 
 impl ReadDataRequest<'_> {
@@ -130,9 +132,22 @@ impl ReadDataRequest<'_> {
         self
     }
 
+    /// Forward an authorization header with this read request.
+    #[must_use]
+    pub fn authorization(mut self, value: impl Into<String>) -> Self {
+        self.authorization = Some(value.into());
+        self
+    }
+
     /// Send the request.
     pub async fn send(&self) -> Result<ReadResponse> {
-        self.client.get(&self.path, schema_query(self.schema)).await
+        self.client
+            .get_with_authorization(
+                &self.path,
+                schema_query(self.schema),
+                self.authorization.as_deref(),
+            )
+            .await
     }
 }
 

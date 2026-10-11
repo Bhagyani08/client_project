@@ -18,7 +18,7 @@
 use axum::{
     Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, header::AUTHORIZATION, StatusCode},
     response::Json,
     routing::get,
 };
@@ -248,6 +248,7 @@ async fn component_data_read(
     State(topology): State<Topology>,
     Path((component_id, data_id)): Path<(String, String)>,
     WithRejection(Query(query), _): WithRejection<Query<ReadDataQuery>, Error>,
+    headers: HeaderMap,
 ) -> Result<Json<ReadResponse>> {
     let topo = topology.read().await;
     let entity = topo
@@ -257,7 +258,12 @@ async fn component_data_read(
         .data_provider()
         .ok_or_else(|| Error::ProviderNotAvailable("data".into()))?;
 
-    let value = provider.read(&data_id, query.include_schema).await?;
+    let authorization = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let value = provider
+        .read_with_authorization(&data_id, query.include_schema, authorization)
+        .await?;
     let schema = query.include_schema.then(|| {
         read_response_schema(
             &data_schema_id("components", &component_id, &data_id),

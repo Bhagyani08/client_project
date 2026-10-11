@@ -110,8 +110,9 @@ impl<S: EcuGateway, T: EcuManager> UdsManager<S, T> {
             return Ok(());
         };
 
+        let has_detection_requests = !ecu.read().await.get_variant_detection_requests().is_empty();
         let service_responses = self.gather_detection_responses(ecu_name, ecu).await?;
-        if service_responses.is_empty() {
+        if service_responses.is_empty() && has_detection_requests {
             return self.mark_group_unreachable(ecu).await;
         }
 

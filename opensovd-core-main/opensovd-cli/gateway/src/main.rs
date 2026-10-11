@@ -6,13 +6,14 @@
 mod cli;
 mod cors;
 mod serve_dir;
+mod proxy;
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
 
 use anyhow::Context;
 use base64::Engine;
-use opensovd_core::Topology;
+
 use opensovd_extra::{JwtAlgorithm, JwtAuthenticator, RegorusAuthorizer};
 #[cfg(feature = "mock")]
 use opensovd_mocks::create_mock_topology;
@@ -364,13 +365,56 @@ async fn configure_topology<Vendor, Authn, Authz, Layer>(
         tracing::info!(target: TARGET, "Mock topology enabled");
         create_mock_topology().await
     } else {
-        Topology::default()
+        opensovd_core::Topology::default()
     };
 
     #[cfg(not(feature = "mock"))]
-    let topology = Topology::default();
+    let topology = opensovd_core::Topology::default();
+    
+    let topo_clone = topology.clone();
+    tokio::spawn(async move {
+        run_mdns_discovery_daemon(topo_clone).await;
+    });
 
     builder.topology(topology)
+}
+
+async fn run_mdns_discovery_daemon(topology: opensovd_core::Topology) {
+    let mdns = mdns_sd::ServiceDaemon::new().unwrap();
+    let service_type = "_sovd._tcp.local.";
+    let receiver = mdns.browse(service_type).unwrap();
+    
+    while let Ok(event) = receiver.recv_async().await {
+        if let mdns_sd::ServiceEvent::ServiceResolved(info) = event {
+            if let Some(target_ip) = info.get_addresses().iter().next() {
+                let target_port = info.get_port();
+                let base_path = info.get_property_val_str("base_path").unwrap_or("/sovd/v1");
+                tracing::info!(target: TARGET, "Discovered new SOVD Service at {}:{}{}", target_ip, target_port, base_path);
+                
+                let discovery_url = format!("http://{}:{}{}", target_ip, target_port, base_path);
+                let topo_clone = topology.clone();
+                
+                tokio::spawn(async move {
+                    if let Ok(client) = opensovd_client::Client::builder().base_uri(&discovery_url).unwrap().build() {
+                        if let Ok(components) = client.list_components().send().await {
+                            let mut guard = topo_clone.write().await;
+                            for comp in components.data.items {
+                                if let Ok(provider) = proxy::HttpProxyProvider::new(&discovery_url, &comp.id) {
+                                    let name = if comp.name.is_empty() { "Discovered ECU".to_string() } else { comp.name.clone() };
+                                    let component = opensovd_core::Component::new(&comp.id, &name)
+                                        .with_data_provider(provider);
+                                    guard.add_component(component);
+                                    tracing::info!(target: TARGET, "Successfully mapped dynamic route for {} to new service!", comp.id);
+                                }
+                            }
+                        } else {
+                            tracing::warn!(target: TARGET, "Failed to list components from {}", discovery_url);
+                        }
+                    }
+                });
+            }
+        }
+    }
 }
 
 fn notify_readiness() {

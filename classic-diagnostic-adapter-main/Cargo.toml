@@ -39,6 +39,7 @@ members = [
   "integration-tests",
   "cda-build",
   "override-macros",
+  "testcontainer/can-ecu-sim",
 ]
 
 [workspace.dependencies]

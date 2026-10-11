@@ -42,6 +42,10 @@ tower-http = { workspace = true, features = ["cors", "fs"] }
 tracing = { workspace = true }
 clap = { workspace = true, features = ["cargo", "derive", "env", "error-context", "help", "std", "usage"] }
 socket2 = { workspace = true, optional = true }
+opensovd-client = { workspace = true }
+mdns-sd = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sd-notify = { workspace = true }

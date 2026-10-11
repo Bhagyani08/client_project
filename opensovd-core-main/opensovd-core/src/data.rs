@@ -94,6 +94,16 @@ pub trait DataProvider: Send + Sync + 'static {
 
     async fn read(&self, data_id: &str, include_schema: bool) -> Result<Data>;
 
+    /// Read a value with the caller's authorization header for proxy providers.
+    async fn read_with_authorization(
+        &self,
+        data_id: &str,
+        include_schema: bool,
+        _authorization: Option<&str>,
+    ) -> Result<Data> {
+        self.read(data_id, include_schema).await
+    }
+
     async fn write(&self, data_id: &str, value: serde_json::Value) -> Result<()>;
 
     /// Returns unique categories from all data values.

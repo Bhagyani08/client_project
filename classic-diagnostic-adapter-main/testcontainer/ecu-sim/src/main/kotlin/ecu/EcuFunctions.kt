@@ -50,6 +50,16 @@ fun NetworkingData.addDoipEntity(
     }
 }
 
+fun NetworkingData.addCanEntity(
+    name: String,
+    logicalAddress: Short,
+    functionalAddress: Short,
+    initialEcuState: EcuState? = null,
+    block: DoipEntityDataHandler = {},
+) {
+    addDoipEntity(name, logicalAddress, functionalAddress, null, null, initialEcuState, block)
+}
+
 fun DoipEntityData.addCanEcu(
     name: String,
     logicalAddress: Short,

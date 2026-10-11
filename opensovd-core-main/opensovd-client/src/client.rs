@@ -294,20 +294,39 @@ impl Client {
 
     /// GET a JSON resource at `path` (relative to the base URI) with optional query parameters.
     pub async fn get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> Result<T> {
-        self.get_uri(build_uri_with_query(&self.base_uri, path, query)?)
-            .await
+        self.get_with_authorization(path, query, None).await
+    }
+
+    pub(crate) async fn get_with_authorization<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        authorization: Option<&str>,
+    ) -> Result<T> {
+        self.get_uri(
+            build_uri_with_query(&self.base_uri, path, query)?,
+            authorization,
+        )
+        .await
     }
 
     /// GET the JSON resource at an href the server advertised.
     pub(crate) async fn follow<T: DeserializeOwned>(&self, href: &UriReference) -> Result<T> {
-        self.get_uri(href.0.parse()?).await
+        self.get_uri(href.0.parse()?, None).await
     }
 
-    async fn get_uri<T: DeserializeOwned>(&self, uri: http::Uri) -> Result<T> {
-        let req = http::Request::builder()
+    async fn get_uri<T: DeserializeOwned>(
+        &self,
+        uri: http::Uri,
+        authorization: Option<&str>,
+    ) -> Result<T> {
+        let mut builder = http::Request::builder()
             .method(http::Method::GET)
-            .uri(uri)
-            .body(Full::new(Bytes::new()))?;
+            .uri(uri);
+        if let Some(authorization) = authorization {
+            builder = builder.header(http::header::AUTHORIZATION, authorization);
+        }
+        let req = builder.body(Full::new(Bytes::new()))?;
         let bytes = self.request(req).await?;
         Ok(serde_json::from_slice(&bytes)?)
     }

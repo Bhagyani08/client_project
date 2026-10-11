@@ -20,7 +20,7 @@ services:
     cap_add:
       - NET_ADMIN
     profiles:
-      - can
+      - mixed
     networks:
       - testcontainer-net
     healthcheck:
@@ -30,6 +30,43 @@ services:
       retries: 15
       start_period: 10s
     restart: unless-stopped
+
+  socketcand-vcan1:
+    build:
+      context: ./socketcand
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    profiles:
+      - can
+      - mixed
+    networks:
+      - testcontainer-net
+    command: ["/bin/sh", "-c", "ip link add dev vcan1 type vcan && ip link set up vcan1 && exec socketcand -n -i vcan1 -l eth0 -p 29537"]
+    healthcheck:
+      test: ["CMD-SHELL", "ss -ltn | grep -q 29537 || exit 1"]
+      interval: 1s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+    restart: unless-stopped
+
+  can-ecu-sim:
+    build:
+      context: ..
+      dockerfile: testcontainer/can-ecu-sim/Dockerfile
+    environment:
+      # Use the isolated vcan1 bus
+      - SIM_CAN_INTERFACE=socketcand:socketcand-vcan1:29537:vcan1
+      - OVERRIDE_VIN=${OVERRIDE_VIN:-E400-PURE-CAN-SIM}
+    networks:
+      - testcontainer-net
+    depends_on:
+      - socketcand-vcan1
+    restart: unless-stopped
+    profiles:
+      - can
+      - mixed
 
   ecu-sim:
     build:
@@ -43,13 +80,15 @@ services:
       - SIM_NETWORK_INTERFACE=eth0
       # When a socketcand host is set the sim serves its ECUs over CAN/ISO-TP
       # via that daemon. Empty/unset disables the CAN path (DoIP-only).
-      - SIM_CAN_SOCKETCAND_HOST=${SIM_CAN_SOCKETCAND_HOST:-}
-      - SIM_CAN_SOCKETCAND_PORT=${SIM_CAN_SOCKETCAND_PORT:-29536}
-      - SIM_CAN_SOCKETCAND_BUS=${SIM_CAN_SOCKETCAND_BUS:-vcan0}
+      - SIM_CAN_SOCKETCAND_HOST=socketcand
+      - SIM_CAN_SOCKETCAND_PORT=29536
+      - SIM_CAN_SOCKETCAND_BUS=vcan0
     ports:
       - "${SIM_CONTROL_PORT:-8181}:8181"
     networks:
       - testcontainer-net
+    profiles:
+      - mixed
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8181/ || exit 1"]
       interval: 1s
@@ -66,7 +105,7 @@ services:
         - SOURCE_DATE_EPOCH
         - SOURCE_GIT_SHA
         # Extra cargo features for the CDA image; "can-socketcand" for CAN tests.
-        - CDA_FEATURES=${CDA_FEATURES:-}
+        - CDA_FEATURES=can can-socketcand
     ports:
       - "${CDA_PORT:-20002}:20002"
     volumes:
@@ -77,12 +116,34 @@ services:
     networks:
       - testcontainer-net
     depends_on:
-      ecu-sim:
+      socketcand-vcan1:
         condition: service_healthy
+      can-ecu-sim:
+        condition: service_started
     environment:
       - RUST_LOG=debug
       - CDA_CONFIG_FILE=/app/cda-test-config.toml
     command: ["-d", "/app/odx"]
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: ../../opensovd-core-main
+      dockerfile: Dockerfile.gateway
+    ports:
+      - "7690:7690"
+    networks:
+      - testcontainer-net
+    depends_on:
+      - cda
+    restart: unless-stopped
+
+  client:
+    build:
+      context: ../../opensovd-core-main
+      dockerfile: Dockerfile.client
+    networks:
+      - testcontainer-net
     restart: unless-stopped
 
 networks:

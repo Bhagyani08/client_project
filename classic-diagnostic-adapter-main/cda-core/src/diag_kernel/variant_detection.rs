@@ -38,7 +38,7 @@ pub(super) fn prepare_variant_detection(
                         patterns.iter().flat_map(|pattern| {
                             pattern.matching_parameter().into_iter().flat_map(|params| {
                                 params.iter().filter_map(|mp| {
-                                    mp.diag_service()
+                                    tracing::warn!("MP! expected={:?} svc={:?}", mp.expected_value(), mp.diag_service().is_some()); mp.diag_service()
                                         .and_then(|ds| ds.diag_comm())
                                         .and_then(|dc| dc.short_name())
                                         .map(|sn| {

@@ -1,0 +1,43 @@
+--- opensovd-cli/gateway/src/main.rs
++++ opensovd-cli/gateway/src/main.rs
+@@ -387,14 +387,22 @@
+         if let mdns_sd::ServiceEvent::ServiceResolved(info) = event {
+             if let Some(target_ip) = info.get_addresses().iter().next() {
+                 let target_port = info.get_port();
+-                tracing::info!(target: TARGET, "Discovered new SOVD Service at {}:{}", target_ip, target_port);
++                let base_path = info.get_property_val_str("base_path").unwrap_or("/sovd/v1");
++                tracing::info!(target: TARGET, "Discovered new SOVD Service at {}:{}{}", target_ip, target_port, base_path);
+                 
+-                let discovery_url = format!("http://{}:{}/Vehicle/v15", target_ip, target_port);
+-                let mut guard = topology.write().await;
+-                
+-                if let Ok(provider) = proxy::HttpProxyProvider::new(&discovery_url, "flxc1000") {
+-                    let component = opensovd_core::Component::new("flxc1000", "Discovered ECU")
+-                        .with_data_provider(provider);
+-                    guard.add_component(component);
+-                    tracing::info!(target: TARGET, "Successfully mapped route for flxc1000 to new service!");
+-                }
++                let discovery_url = format!("http://{}:{}{}", target_ip, target_port, base_path);
++                let topo_clone = topology.clone();
++                
++                tokio::spawn(async move {
++                    if let Ok(client) = opensovd_client::Client::builder().base_uri(&discovery_url).unwrap().build() {
++                        if let Ok(components) = client.list_components().send().await {
++                            let mut guard = topo_clone.write().await;
++                            for comp in components.data.items {
++                                if let Ok(provider) = proxy::HttpProxyProvider::new(&discovery_url, &comp.id) {
++                                    let name = comp.name.unwrap_or_else(|| "Discovered ECU".to_string());
++                                    let component = opensovd_core::Component::new(&comp.id, &name)
++                                        .with_data_provider(provider);
++                                    guard.add_component(component);
++                                    tracing::info!(target: TARGET, "Successfully mapped dynamic route for {} to new service!", comp.id);
++                                }
++                            }
++                        } else {
++                            tracing::warn!(target: TARGET, "Failed to list components from {}", discovery_url);
++                        }
++                    }
++                });
+             }
+         }
+     }

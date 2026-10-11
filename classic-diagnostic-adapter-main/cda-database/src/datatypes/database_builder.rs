@@ -264,6 +264,50 @@ impl<'a> EcuDataBuilder<'a> {
         .expect("Failed to create DiagnosticDatabase from built ECU data")
     }
 
+    /// Serializes the given `EcuDataParams` into a flatbuffer, wraps the result
+    /// in an `MddFile` protobuf, and writes it to the specified path with the MDD magic header.
+    /// Consumes the builder.
+    pub fn write_mdd_file(
+        mut self,
+        params: EcuDataParams<'a>,
+        path: &str,
+    ) -> std::io::Result<()> {
+        let ecu_name_str = params.ecu_name.to_owned();
+        let ecu_name_offset = self.fbb.create_string(&ecu_name_str);
+        let revision_offset = self.fbb.create_string(params.revision);
+        let version_offset = self.fbb.create_string(params.version);
+
+        let ecu_data_args =
+            self.ecu_data_args(params, ecu_name_offset, revision_offset, version_offset);
+
+        let ecu_data = dataformat::EcuData::create(&mut self.fbb, &ecu_data_args);
+        self.fbb.finish(ecu_data, None);
+        let blob = self.fbb.finished_data().to_vec();
+
+        let chunk = crate::proto::fileformat::Chunk {
+            r#type: crate::proto::fileformat::chunk::DataType::DiagnosticDescription as i32,
+            name: Some(ecu_name_str.clone()),
+            data: Some(bytes::Bytes::from(blob)),
+            ..Default::default()
+        };
+
+        let mdd_file = crate::proto::fileformat::MddFile {
+            version: "0".to_owned(),
+            ecu_name: ecu_name_str,
+            revision: Some("1".to_owned()),
+            chunks: vec![chunk],
+            ..Default::default()
+        };
+
+        use prost::Message;
+        let magic = b"MDD version 0      \0";
+        let mut buf = Vec::with_capacity(magic.len() + mdd_file.encoded_len());
+        buf.extend_from_slice(magic);
+        mdd_file.encode(&mut buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        std::fs::write(path, &buf)
+    }
+
     /// Finishes building and returns the
     /// [`DiagnosticDatabase`](super::DiagnosticDatabase) with the given config.
     ///
@@ -1310,6 +1354,11 @@ impl<'a> EcuDataBuilder<'a> {
         };
 
         dataformat::CompuMethod::create(&mut self.fbb, &compu_method_args)
+    }
+
+    /// Helper to create an identical compu method without needing CompuCategory.
+    pub fn create_compu_method_identical(&mut self) -> WIPOffset<dataformat::CompuMethod<'a>> {
+        self.create_compu_method(CompuCategory::Identical, None, None)
     }
 
     /// Build a `TEXTTABLE` `CompuMethod` from a slice of scale entries.

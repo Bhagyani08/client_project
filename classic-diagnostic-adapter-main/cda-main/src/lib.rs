@@ -384,6 +384,8 @@ where
         ));
     }
 
+    let mdns_port = config.server.port();
+
     // Retained for the full server lifetime, so its event dispatcher keeps
     // running until explicit shutdown.
     let Some(communication_runtime) = await_startup_stage(
@@ -404,6 +406,41 @@ where
     };
 
     tracing::info!("CDA fully initialized and ready to serve requests");
+    
+    // Broadcast presence via mDNS
+    tokio::spawn(async move {
+        if let Ok(mdns) = mdns_sd::ServiceDaemon::new() {
+            let service_type = "_sovd._tcp.local.";
+            let instance_name = "CDA"; // Unique name for the CDA
+            let host_name = "cda.local."; // Default hostname
+            
+            let mut properties: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            properties.insert("base_path".to_string(), "/Vehicle/v15".to_string());
+
+            if let Ok(service_info) = mdns_sd::ServiceInfo::new(
+                service_type,
+                instance_name,
+                host_name,
+                "", // Use empty string or auto-detect
+                mdns_port,
+                properties,
+            ) {
+                let info = service_info.enable_addr_auto();
+                if let Err(e) = mdns.register(info) {
+                    tracing::error!("Failed to register mDNS service: {}", e);
+                } else {
+                    tracing::info!("Registered mDNS service on port {}", mdns_port);
+                    // Keep the daemon alive
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    }
+                }
+            } else {
+                tracing::error!("Failed to create mDNS service info");
+            }
+        }
+    });
+
     if let Some(provider) = &webserver_state.main_health_provider {
         provider.update_status(cda_health::Status::Up).await;
     }

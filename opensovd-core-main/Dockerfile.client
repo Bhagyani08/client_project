@@ -1,0 +1,14 @@
+FROM rust:1.80-bookworm AS builder
+WORKDIR /app
+COPY . .
+# Build the rust client example
+RUN cargo build --release --example client
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/release/examples/client /usr/local/bin/sovd-client
+
+# The client needs a command to keep it alive so we can run commands inside it,
+# or we can run the client directly via docker run.
+# Here we keep it alive so it runs as a daemon in docker-compose.
+CMD ["tail", "-f", "/dev/null"]
